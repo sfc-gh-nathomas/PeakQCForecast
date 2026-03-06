@@ -11,6 +11,7 @@ import os
 import html as html_lib
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 
@@ -140,7 +141,7 @@ PLAY_OPTIONS = {
 
 
 # ---------------------------------------------------------------------------
-# Snowflake connection (cached singleton)
+# Snowflake connection (cached singleton + pool for concurrency)
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def get_sf_connection():
@@ -148,100 +149,181 @@ def get_sf_connection():
     return get_connection()
 
 
+@st.cache_resource
+def get_sf_connection_pool(_pool_size=8):
+    """Create a pool of Snowflake connections for concurrent queries."""
+    return [get_connection() for _ in range(_pool_size)]
+
+
 # ---------------------------------------------------------------------------
-# Data loading — all queries for a given GVP
+# Data loading — all queries for a given GVP, with progress bar + concurrency
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner="Loading data from Snowflake...")
-def load_all_data(gvp_name):
-    """Run all queries for the given GVP and return a data dict."""
-    # Override the global CONFIG with selected GVP
+def _run_all_queries(gvp_name):
+    """Run all queries with concurrent execution and a visible progress bar."""
     CONFIG["gvp_name"] = gvp_name
-
     conn = get_sf_connection()
+    pool_conns = get_sf_connection_pool()
 
-    # Fiscal calendar (populates CONFIG dates)
+    total_steps = 30
+    completed = [0]  # mutable for closure
+    progress = st.progress(0, text="Connecting to Snowflake...")
+
+    def _tick(label):
+        completed[0] += 1
+        progress.progress(min(completed[0] / total_steps, 1.0), text=label)
+
+    # --- Phase 1: Fiscal calendar (must run first, populates CONFIG dates) ---
+    _tick("Phase 1: Fiscal calendar...")
     fiscal = q_fiscal_calendar(conn)
+    CONFIG["day_number"] = int(fiscal["DAY_NUMBER"])
 
-    # Core queries
-    revenue = q_qtd_revenue(conn)
-    forecasts = q_forecast_calls(conn)
-    deployed = q_deployed_qtd(conn)
-    last7 = q_last7_deployed(conn)
-    pipeline = q_open_pipeline(conn)
-    risk_analysis = q_pipeline_risk(conn)
-    top5 = q_top5_use_cases(conn)
-    play_summary = q_sales_play_summary(conn)
-    play_detail = q_play_detail_metrics(conn)
-    bronze_tb_total = q_bronze_tb_total(conn)
-    play_use_cases = q_play_use_cases(conn)
-    pacing = q_prior_fy_pacing(conn, fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"])
-    play_risk = q_play_risk_detail(conn)
-    high_risk_ucs = q_high_risk_use_cases(conn)
-    play_targets = q_play_targets(conn)
-    partner_sd = q_partner_sd_attach(conn)
-    uc_velocity = q_use_case_velocity(conn)
-    bronze_created = q_bronze_created_qtd(conn)
+    # --- Phase 2: Run independent queries concurrently ---
+    _tick("Phase 2: Running queries in parallel...")
 
-    # Collect account IDs for consumption/SI/bronze lookups
+    results = {}
+
+    def _run(name, fn, *args):
+        """Execute a query function and store the result."""
+        results[name] = fn(*args)
+
+    # Build (name, fn, args) tuples — each gets a connection from the pool
+    phase2_queries = [
+        ("revenue", q_qtd_revenue),
+        ("forecasts", q_forecast_calls),
+        ("deployed", q_deployed_qtd),
+        ("last7", q_last7_deployed),
+        ("pipeline", q_open_pipeline),
+        ("risk_analysis", q_pipeline_risk),
+        ("top5", q_top5_use_cases),
+        ("play_summary", q_sales_play_summary),
+        ("play_detail", q_play_detail_metrics),
+        ("bronze_tb_total", q_bronze_tb_total),
+        ("play_use_cases", q_play_use_cases),
+        ("play_risk", q_play_risk_detail),
+        ("high_risk_ucs", q_high_risk_use_cases),
+        ("play_targets", q_play_targets),
+        ("partner_sd", q_partner_sd_attach),
+        ("uc_velocity", q_use_case_velocity),
+        ("bronze_created", q_bronze_created_qtd),
+        ("si_theater", q_si_theater_totals),
+        ("bronze_tb_acct", q_bronze_tb_by_account),
+        ("velocity", q_deployment_velocity),
+        ("pipeline_detail", q_risk_adjusted_pipeline_detail),
+        ("pipeline_phases", q_current_pipeline_phases),
+    ]
+    # These need extra args beyond conn
+    phase2_extra = [
+        ("pacing", q_prior_fy_pacing, fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"]),
+        ("hist_conv_rates", q_historical_conversion_rates, fiscal["DAY_NUMBER"]),
+    ]
+
+    label_map = {
+        "revenue": "QTD revenue", "forecasts": "Forecast calls",
+        "deployed": "Deployed QTD", "last7": "Last 7 days",
+        "pipeline": "Open pipeline", "risk_analysis": "Pipeline risk",
+        "top5": "Top 5 UCs", "play_summary": "Play summary",
+        "play_detail": "Play detail", "bronze_tb_total": "Bronze TB",
+        "play_use_cases": "Play use cases", "play_risk": "Play risk detail",
+        "high_risk_ucs": "High risk UCs (Cortex AI)", "play_targets": "Play targets",
+        "partner_sd": "Partner/SD attach", "uc_velocity": "UC velocity",
+        "bronze_created": "Bronze created", "si_theater": "SI theater totals",
+        "bronze_tb_acct": "Bronze TB by acct", "velocity": "Deployment velocity",
+        "pipeline_detail": "Risk-adj pipeline", "pipeline_phases": "Pipeline phases",
+        "pacing": "Pacing", "hist_conv_rates": "Historical conv rates",
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        all_jobs = []
+        for name, fn in phase2_queries:
+            all_jobs.append((name, fn))
+        for name, fn, *extra in phase2_extra:
+            all_jobs.append((name, fn, *extra))
+
+        for idx, job in enumerate(all_jobs):
+            name = job[0]
+            fn = job[1]
+            extra_args = job[2:] if len(job) > 2 else ()
+            c = pool_conns[idx % len(pool_conns)]
+            fut = executor.submit(_run, name, fn, c, *extra_args)
+            futures[fut] = label_map.get(name, name)
+
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                future.result()
+                _tick(f"Completed: {label}")
+            except Exception as e:
+                _tick(f"FAILED: {label}")
+                raise e
+
+    # --- Phase 3: Queries needing results from phase 2 ---
+    _tick("Phase 3: Consumption & SI usage...")
     all_account_ids = set()
-    for uc in top5:
+    for uc in results["top5"]:
         all_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
-    for play in play_use_cases.values():
+    for play in results["play_use_cases"].values():
         for uc in play:
             all_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
     all_account_ids.discard("")
 
     si_account_ids = set()
-    for uc in play_use_cases.get("si", []):
+    for uc in results["play_use_cases"].get("si", []):
         si_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
     si_account_ids.discard("")
 
-    consumption = q_consumption(conn, all_account_ids)
-    si_theater = q_si_theater_totals(conn)
-    si_usage = q_si_usage(conn, si_account_ids)
-    bronze_tb_acct = q_bronze_tb_by_account(conn)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_run, "consumption", q_consumption, pool_conns[0], all_account_ids)
+        f2 = executor.submit(_run, "si_usage", q_si_usage, pool_conns[1], si_account_ids)
+        f1.result()
+        f2.result()
+    _tick("Completed: Consumption & SI usage")
 
-    # Forecast analysis
-    CONFIG["day_number"] = int(fiscal["DAY_NUMBER"])
-    velocity = q_deployment_velocity(conn)
-    pipeline_detail = q_risk_adjusted_pipeline_detail(conn)
-    pipeline_phases = q_current_pipeline_phases(conn)
-    hist_conv_rates = q_historical_conversion_rates(conn, fiscal["DAY_NUMBER"])
+    # --- Phase 4: Forecast analysis (CPU-bound, fast) ---
+    _tick("Phase 4: Forecast models...")
     forecast_analysis = compute_forecast_analysis(
-        pipeline_phases, hist_conv_rates, deployed, risk_analysis,
-        forecasts["most_likely"], pacing
+        results["pipeline_phases"], results["hist_conv_rates"],
+        results["deployed"], results["risk_analysis"],
+        results["forecasts"]["most_likely"], results["pacing"]
     )
-    backtest_results = q_backtest_models(conn, hist_conv_rates)
+
+    _tick("Backtest models...")
+    backtest_results = q_backtest_models(pool_conns[0], results["hist_conv_rates"])
     forecast_analysis["backtest"] = backtest_results
+
+    _tick("Weighted ensemble...")
     compute_weighted_ensemble(forecast_analysis, backtest_results, day_number=int(fiscal["DAY_NUMBER"]))
-    forecast_analysis["velocity"] = velocity
-    forecast_analysis["pipeline_detail"] = pipeline_detail
+    forecast_analysis["velocity"] = results["velocity"]
+    forecast_analysis["pipeline_detail"] = results["pipeline_detail"]
+
+    progress.progress(1.0, text="Done!")
+    progress.empty()
 
     return {
         "fiscal": fiscal,
-        "revenue": revenue,
-        "forecasts": forecasts,
-        "deployed": deployed,
-        "last7": last7,
-        "pipeline": pipeline,
-        "risk_analysis": risk_analysis,
-        "top5": top5,
-        "play_summary": play_summary,
-        "play_detail": play_detail,
-        "play_use_cases": play_use_cases,
-        "play_risk": play_risk,
-        "high_risk_ucs": high_risk_ucs,
-        "consumption": consumption,
-        "bronze_tb_total": bronze_tb_total,
-        "bronze_tb_acct": bronze_tb_acct,
-        "si_usage": si_usage,
-        "si_theater": si_theater,
-        "pacing": pacing,
+        "revenue": results["revenue"],
+        "forecasts": results["forecasts"],
+        "deployed": results["deployed"],
+        "last7": results["last7"],
+        "pipeline": results["pipeline"],
+        "risk_analysis": results["risk_analysis"],
+        "top5": results["top5"],
+        "play_summary": results["play_summary"],
+        "play_detail": results["play_detail"],
+        "play_use_cases": results["play_use_cases"],
+        "play_risk": results["play_risk"],
+        "high_risk_ucs": results["high_risk_ucs"],
+        "consumption": results["consumption"],
+        "bronze_tb_total": results["bronze_tb_total"],
+        "bronze_tb_acct": results["bronze_tb_acct"],
+        "si_usage": results["si_usage"],
+        "si_theater": results["si_theater"],
+        "pacing": results["pacing"],
         "forecast_analysis": forecast_analysis,
-        "play_targets": play_targets,
-        "partner_sd": partner_sd,
-        "uc_velocity": uc_velocity,
-        "bronze_created": bronze_created,
+        "play_targets": results["play_targets"],
+        "partner_sd": results["partner_sd"],
+        "uc_velocity": results["uc_velocity"],
+        "bronze_created": results["bronze_created"],
         # Snapshot of CONFIG values at query time (restored on cache hit for
         # functions like _build_forecast_tab that read CONFIG directly)
         "_config": {
@@ -260,7 +342,23 @@ def load_all_data(gvp_name):
             "risk_thresholds": CONFIG.get("risk_thresholds"),
             "output_dir": CONFIG.get("output_dir"),
         },
+        "_loaded_at": datetime.now(),
     }
+
+
+def load_all_data(gvp_name):
+    """Load data with session_state caching (10-min TTL) and progress bar."""
+    cache_key = f"peak_data_{gvp_name}"
+    cached = st.session_state.get(cache_key)
+
+    if cached is not None:
+        loaded_at = cached.get("_loaded_at")
+        if loaded_at and (datetime.now() - loaded_at).total_seconds() < 600:
+            return cached
+
+    data = _run_all_queries(gvp_name)
+    st.session_state[cache_key] = data
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -911,17 +1009,26 @@ def main():
             "Sales Play (Script tab only)",
             options=play_labels,
             index=0,
+            key="play_selector",
             help="Select which Sales Play to feature in the Script tab. Does not affect Go-Lives or Forecast tabs.",
         )
-        selected_play_key = PLAY_OPTIONS[selected_play_label]
 
         st.markdown("---")
+        cache_key = f"peak_data_{selected_gvp}"
+        cached = st.session_state.get(cache_key)
+        if cached and cached.get("_loaded_at"):
+            last_refresh = cached["_loaded_at"].strftime('%H:%M:%S')
+        else:
+            last_refresh = "not yet loaded"
         st.markdown(
             f"*Data cached for 10 min.*  \n"
-            f"*Last refresh: {datetime.now().strftime('%H:%M:%S')}*"
+            f"*Last refresh: {last_refresh}*"
         )
         if st.button("Refresh Data"):
-            load_all_data.clear()
+            # Clear all cached data from session state
+            for key in list(st.session_state.keys()):
+                if key.startswith("peak_data_"):
+                    del st.session_state[key]
             st.rerun()
 
     # --- Load data ---
@@ -949,6 +1056,8 @@ def main():
         "Use Case Go-Lives",
         "Forecast Analysis",
     ])
+
+    selected_play_key = PLAY_OPTIONS[st.session_state.get("play_selector", play_labels[0])]
 
     with tab_script:
         render_script_tab(data, selected_play_key)
