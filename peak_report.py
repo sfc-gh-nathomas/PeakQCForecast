@@ -761,6 +761,122 @@ def q_play_targets(conn):
     return targets
 
 
+def q_partner_sd_attach(conn):
+    """Query: Partner and SD attach rates on open go-live pipeline."""
+    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+    rows = run_query(conn, f"""
+        SELECT
+            u.IMPLEMENTER_C,
+            COUNT(*) as CNT,
+            SUM(u.USE_CASE_ACV) as ACV
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.USE_CASE_ACV > 0
+          AND u.IS_WENT_LIVE = FALSE
+          AND u.IS_LOST = FALSE
+          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+          AND u.USE_CASE_STAGE NOT IN ({excluded})
+        GROUP BY u.IMPLEMENTER_C
+    """, "Query: Partner/SD Attach")
+    total_acv = 0
+    total_count = 0
+    partner_acv = 0
+    partner_count = 0
+    sd_acv = 0
+    sd_count = 0
+    unassisted_acv = 0
+    unassisted_count = 0
+    partner_values = {"Partner Only", "Partner Prime + Snowflake SD", "Snowflake SD Prime + Partner"}
+    sd_values = {"Snowflake SD Prime", "Partner Prime + Snowflake SD",
+                 "Customer Prime + Snowflake SD", "Snowflake SD Prime + Partner"}
+    unassisted_values = {"Customer Only", "Unknown", "None", "", None}
+    for r in rows:
+        acv = float(r["ACV"] or 0)
+        cnt = int(r["CNT"] or 0)
+        impl = r["IMPLEMENTER_C"] or ""
+        total_acv += acv
+        total_count += cnt
+        if impl in partner_values:
+            partner_acv += acv
+            partner_count += cnt
+        if impl in sd_values:
+            sd_acv += acv
+            sd_count += cnt
+        if impl in unassisted_values:
+            unassisted_acv += acv
+            unassisted_count += cnt
+    partner_rate = (partner_acv / total_acv * 100) if total_acv else 0
+    sd_rate = (sd_acv / total_acv * 100) if total_acv else 0
+    return {
+        "total_acv": total_acv, "total_count": total_count,
+        "partner_acv": partner_acv, "partner_count": partner_count, "partner_rate": partner_rate,
+        "sd_acv": sd_acv, "sd_count": sd_count, "sd_rate": sd_rate,
+        "unassisted_acv": unassisted_acv, "unassisted_count": unassisted_count,
+    }
+
+
+def q_use_case_velocity(conn):
+    """Query: Use case velocity medians for CQ go-lives + prior quarter."""
+    def _query_velocity(start, end, label):
+        rows = run_query(conn, f"""
+            SELECT
+                MEDIAN(d.TIME_TO_TECH_WIN) as MEDIAN_TW,
+                MEDIAN(DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE)) as MEDIAN_WON_TO_IMP,
+                MEDIAN(d.TIME_WON_TO_DEPLOYED) as MEDIAN_WON_TO_DEPLOYED
+            FROM {CONFIG["raven_uc_table"]} u
+            JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+            JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
+            WHERE a.GVP = '{CONFIG["gvp_name"]}'
+              AND u.USE_CASE_ACV > 0
+              AND u.IS_WENT_LIVE = TRUE
+              AND u.DEFAULT_DATE BETWEEN '{start}' AND '{end}'
+        """, f"Query: Use Case Velocity ({label})")
+        if rows and rows[0]["MEDIAN_TW"] is not None:
+            r = rows[0]
+            return {
+                "time_to_tw": float(r["MEDIAN_TW"]) if r["MEDIAN_TW"] is not None else None,
+                "won_to_imp_start": float(r["MEDIAN_WON_TO_IMP"]) if r["MEDIAN_WON_TO_IMP"] is not None else None,
+                "won_to_deployed": float(r["MEDIAN_WON_TO_DEPLOYED"]) if r["MEDIAN_WON_TO_DEPLOYED"] is not None else None,
+            }
+        return {"time_to_tw": None, "won_to_imp_start": None, "won_to_deployed": None}
+
+    current = _query_velocity(CONFIG["quarter_start"], CONFIG["quarter_end"], "Current")
+    # Prior quarter = last quarter of prior FY
+    prior_quarters = CONFIG.get("prior_fy_quarters", [])
+    if prior_quarters:
+        pq_start, pq_end = prior_quarters[-1]
+        prior = _query_velocity(pq_start, pq_end, "Prior Q")
+    else:
+        prior = {"time_to_tw": None, "won_to_imp_start": None, "won_to_deployed": None}
+    return {"current": current, "prior": prior}
+
+
+def q_bronze_created_qtd(conn):
+    """Query: Bronze UCs created in current quarter + creation target."""
+    # Created count
+    created_rows = run_query(conn, f"""
+        SELECT COUNT(*) as CREATED_COUNT
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["bronze_campaign"]}'
+          AND u.CREATED_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+    """, "Query: Bronze Created QTD")
+    created = int(created_rows[0]["CREATED_COUNT"]) if created_rows else 0
+    # Creation target
+    target_rows = run_query(conn, """
+        SELECT TARGET_USE_CASE_COUNT
+        FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
+        WHERE MAPPED_THEATER = 'AMSExpansion'
+          AND FISCAL_QUARTER = 'FY2027-Q1'
+          AND MOVEMENT_TYPE = 'Created'
+          AND PRIORITIZED_FEATURE_UC = 'Make Your Data AI Ready'
+    """, "Query: Bronze Creation Target")
+    target = int(target_rows[0]["TARGET_USE_CASE_COUNT"]) if target_rows and target_rows[0]["TARGET_USE_CASE_COUNT"] else None
+    return {"created": created, "target": target}
+
+
 def q_open_pipeline(conn):
     """Query 6: Open Pipeline"""
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
@@ -1197,6 +1313,43 @@ def _play_risk_detail_query(conn, play_name, extra_join, filter_clause):
 
     print(f"    → {play_name}: {len(risk_rows)} risk UCs out of {total} total")
     return {"risk_rows": risk_rows, "total_count": total}
+
+
+def q_high_risk_use_cases(conn):
+    """Query: All at-risk use cases in the quarter for the Script tab table."""
+    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+    rows = run_query(conn, f"""
+        SELECT
+            u.ID as USE_CASE_ID,
+            u.NAME as USE_CASE_NUMBER,
+            u.VH_NAME_C as USE_CASE_NAME,
+            a.SALESFORCE_OWNER_NAME as AE_NAME,
+            a.LEAD_SALES_ENGINEER_NAME as SE_NAME,
+            u.USE_CASE_ACV,
+            u.USE_CASE_RISK_C as RISK_TYPE,
+            SNOWFLAKE.CORTEX.COMPLETE(
+                'llama3.1-70b',
+                CONCAT(
+                    'Summarize this use case risk in 1-2 concise sentences for a sales leadership QC call. Focus on what the risk is and the current mitigation plan. Do not include any preamble or introductory text, just provide the summary directly. Risk type: ',
+                    COALESCE(u.USE_CASE_RISK_C, 'Unknown'),
+                    '. SE Comments: ', COALESCE(u.USE_CASE_COMMENTS_C, 'None'),
+                    '. Next Steps: ', COALESCE(u.NEXT_STEP_C, 'None')
+                )
+            ) as RISK_SUMMARY
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.USE_CASE_ACV > 0
+          AND u.IS_WENT_LIVE = FALSE
+          AND u.IS_LOST = FALSE
+          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+          AND u.USE_CASE_STAGE NOT IN ({excluded})
+          AND u.USE_CASE_RISK_C IS NOT NULL AND u.USE_CASE_RISK_C != '' AND u.USE_CASE_RISK_C != 'None'
+          AND u.USE_CASE_ACV >= {CONFIG["play_threshold"]}
+        ORDER BY u.USE_CASE_ACV DESC
+    """, "Query: High Risk Use Cases (Script)")
+    print(f"  Running: High Risk Use Cases → {len(rows)} at-risk UCs found")
+    return rows
 
 
 def q_play_risk_detail(conn):
@@ -2853,6 +3006,7 @@ def build_html(data):
     play_detail = data["play_detail"]
     play_use_cases = data["play_use_cases"]
     play_risk = data["play_risk"]
+    high_risk_ucs = data.get("high_risk_ucs", [])
     consumption = data["consumption"]
     bronze_tb_total = data["bronze_tb_total"]
     bronze_tb_acct = data["bronze_tb_acct"]
@@ -2870,6 +3024,9 @@ def build_html(data):
     wins_play_summary = data.get("wins_play_summary", {})
     wins_play_use_cases = data.get("wins_play_use_cases", {})
     play_targets = data.get("play_targets", {})
+    partner_sd = data.get("partner_sd", {})
+    uc_velocity = data.get("uc_velocity", {})
+    bronze_created = data.get("bronze_created", {})
 
     quarter = safe_str(fiscal["FISCAL_QUARTER"])
     qstart = safe_str(fiscal["FQ_START"])
@@ -3013,6 +3170,197 @@ def build_html(data):
 
     today_str = datetime.now().strftime("%B %d, %Y")
 
+    # --- Build Script Tab narrative ---
+    # Total pipeline risk
+    total_risk_acv = sum(float(r.get("AT_RISK_ACV", 0) or 0) for r in risk_analysis.values())
+
+    # ML WoW delta as plain text for script
+    ml_delta_val = forecasts.get("ml_delta")
+    if ml_delta_val is None:
+        ml_wow_text = ""
+    elif ml_delta_val == 0:
+        ml_wow_text = " (flat WoW)"
+    else:
+        if ml_delta_val > 0:
+            ml_wow_text = f" (+{fmt_currency(ml_delta_val)} WoW)"
+        else:
+            ml_wow_text = f" (-{fmt_currency(abs(ml_delta_val))} WoW)"
+
+    # Partner/SD attach
+    p_rate = partner_sd.get("partner_rate", 0)
+    sd_rate = partner_sd.get("sd_rate", 0)
+    p_acv = partner_sd.get("partner_acv", 0)
+    p_cnt = partner_sd.get("partner_count", 0)
+    sd_acv_val = partner_sd.get("sd_acv", 0)
+    sd_cnt = partner_sd.get("sd_count", 0)
+    unassisted_acv = partner_sd.get("unassisted_acv", 0)
+    unassisted_cnt = partner_sd.get("unassisted_count", 0)
+    unassisted_rate = (unassisted_acv / partner_sd.get("total_acv", 1) * 100) if partner_sd.get("total_acv") else 0
+
+    # Velocity
+    uc_vel_cur = uc_velocity.get("current", {})
+    uc_vel_prior = uc_velocity.get("prior", {})
+    v_tw = uc_vel_cur.get("time_to_tw")
+    v_imp = uc_vel_cur.get("won_to_imp_start")
+    v_dep = uc_vel_cur.get("won_to_deployed")
+    v_tw_str = f"{v_tw:.0f}" if v_tw is not None else "N/A"
+    v_imp_str = f"{v_imp:.0f}" if v_imp is not None else "N/A"
+    v_dep_str = f"{v_dep:.0f}" if v_dep is not None else "N/A"
+    # Prior quarter subtitles
+    pq_label = CONFIG.get("prior_fy_label", "Prior") + " Q4"
+    def _vel_prior_sub(cur, prior_val):
+        if prior_val is None:
+            return ""
+        return f'<span style="display: block; font-size: 0.45em; color: #888; margin-top: 4px;">{pq_label}: {prior_val:.0f}</span>'
+    v_tw_prior = _vel_prior_sub(v_tw, uc_vel_prior.get("time_to_tw"))
+    v_imp_prior = _vel_prior_sub(v_imp, uc_vel_prior.get("won_to_imp_start"))
+    v_dep_prior = _vel_prior_sub(v_dep, uc_vel_prior.get("won_to_deployed"))
+
+    # Bronze created
+    br_created = bronze_created.get("created", 0)
+    br_create_target = bronze_created.get("target")
+    br_create_target_str = str(br_create_target) if br_create_target is not None else "N/A"
+    br_create_pct = f"{br_created / br_create_target * 100:.0f}%" if br_create_target else "N/A"
+
+    # Play summary shortcuts for script
+    _ps = play_summary
+    _empty_ps = {"acv": 0, "count": 0}
+    br_dep = _ps.get("bronze_deployed", _empty_ps)
+    br_open = _ps.get("bronze_open", _empty_ps)
+    si_dep = _ps.get("si_deployed", _empty_ps)
+    si_open = _ps.get("si_open", _empty_ps)
+    sql_dep = _ps.get("sqlserver_deployed", _empty_ps)
+    sql_open = _ps.get("sqlserver_open", _empty_ps)
+
+    # Build high-risk use case table HTML
+    if high_risk_ucs:
+        hr_rows_html = ""
+        for i, uc in enumerate(high_risk_ucs):
+            uc_id = safe_str(uc.get("USE_CASE_ID", ""))
+            uc_num = html_escape(safe_str(uc.get("USE_CASE_NUMBER", "")))
+            uc_name = html_escape(safe_str(uc.get("USE_CASE_NAME", "")))
+            ae = html_escape(safe_str(uc.get("AE_NAME", "")))
+            se = html_escape(safe_str(uc.get("SE_NAME", "")))
+            acv = float(uc.get("USE_CASE_ACV", 0) or 0)
+            risk_type = html_escape(safe_str(uc.get("RISK_TYPE", "")))
+            raw_summary = safe_str(uc.get("RISK_SUMMARY", ""))
+            # Strip common LLM preambles
+            for prefix in ["Here is a ", "Here's a ", "Here is the ", "Here's the "]:
+                if raw_summary.startswith(prefix):
+                    # Find the end of the preamble line (first colon + newline)
+                    colon_idx = raw_summary.find(":\n")
+                    if colon_idx != -1:
+                        raw_summary = raw_summary[colon_idx + 1:].strip()
+                    break
+            risk_summary = html_escape(raw_summary)
+            sf_link = f"https://snowforce.lightning.force.com/lightning/r/{uc_id}/view" if uc_id else ""
+            uc_num_cell = f'<a href="{sf_link}" target="_blank" style="color: #007bff; text-decoration: none;">{uc_num}</a>' if sf_link else uc_num
+            row_bg = ' style="background: #f8f9fa;"' if i % 2 == 1 else ""
+            hr_rows_html += f"""<tr{row_bg}>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee;">{uc_num_cell}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee;">{uc_name}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee;">{ae}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee;">{se}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee; text-align: right;">{fmt_currency(acv)}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee;">{risk_type}</td>
+<td style="padding: 5px 8px; border-bottom: 1px solid #eee; font-size: 0.85em;">{risk_summary}</td>
+</tr>
+"""
+        high_risk_table_html = f"""
+<div style="margin-top: 12px;">
+<strong>At-Risk Use Cases ({len(high_risk_ucs)}):</strong>
+<table style="width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85em;">
+<tr style="background: #e9ecef; font-weight: bold;">
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">UC Number</th>
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">Name</th>
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">AE</th>
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">SE</th>
+<th style="padding: 6px 8px; text-align: right; border-bottom: 2px solid #dee2e6;">ACV</th>
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">Risk Type</th>
+<th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #dee2e6;">Risk Summary</th>
+</tr>
+{hr_rows_html}
+</table>
+</div>"""
+    else:
+        high_risk_table_html = ""
+
+    script_html = f"""
+<h2>QC Script</h2>
+<div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 24px; font-family: Georgia, serif; font-size: 1.05em; line-height: 1.7;">
+
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Forecast Call</h3>
+<p>For AMSExpansion, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}.
+We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a target of <strong>{fmt_currency(gl_target)}</strong> (<strong>{fmt_pct(deployed_pct_of_target)}</strong> of target).
+Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
+
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Risk and Pacing</h3>
+<p>Total pipeline risk stands at <strong>{fmt_currency(total_risk_acv)}</strong>, leaving
+<strong>{fmt_currency(total_good)}</strong> in good pipeline for <strong>{fmt_pct(good_coverage)}</strong> good coverage vs Most Likely.
+We are currently at <strong>{fmt_pct(deployed_pct_of_target)}</strong> of our go-live target.
+On a day-over-day basis, we are pacing at <strong>{day_avg}</strong> ({day_pct} of prior FY average),
+and on a week-over-week basis at <strong>{week_avg}</strong> ({week_pct} of prior FY average).</p>
+{high_risk_table_html}
+
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Partner and SD Attach</h3>
+<p>Partner attach rate on the open pipeline is <strong>{fmt_pct(p_rate)}</strong>
+({p_cnt} use cases, {fmt_currency(p_acv)} ACV).
+SD attach rate is <strong>{fmt_pct(sd_rate)}</strong>
+({sd_cnt} use cases, {fmt_currency(sd_acv_val)} ACV).
+The remaining <strong>{unassisted_cnt}</strong> use cases ({fmt_currency(unassisted_acv)} ACV, {fmt_pct(unassisted_rate)}) are unassisted (Customer Only, Unknown, or None).</p>
+
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Use Case Velocity</h3>
+<p>For use cases that went live this quarter, our median velocity metrics are:</p>
+<div class="timeline-box">
+  <div class="timeline-item"><span class="timeline-label">Days to TW</span><span class="timeline-days">{v_tw_str}{v_tw_prior}</span></div>
+  <div class="timeline-arrow">&rarr;</div>
+  <div class="timeline-item"><span class="timeline-label">Days to Imp Start</span><span class="timeline-days">{v_imp_str}{v_imp_prior}</span></div>
+  <div class="timeline-arrow">&rarr;</div>
+  <div class="timeline-item"><span class="timeline-label">Days to Deployed</span><span class="timeline-days">{v_dep_str}{v_dep_prior}</span></div>
+</div>
+
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Sales Plays</h3>
+
+<h4 style="color: #555;">Bronze (Make Your Data AI Ready)</h4>
+<p>Bronze has deployed <strong>{fmt_currency(br_dep["acv"])}</strong> ({br_dep["count"]} UCs) QTD
+with <strong>{fmt_currency(br_open["acv"])}</strong> ({br_open["count"]} UCs) in open pipeline.
+Gap to deployed target: <strong>{bronze_gap}</strong>.
+We have created <strong>{br_created}</strong> Bronze use cases this quarter against a creation target of <strong>{br_create_target_str}</strong> ({br_create_pct}).
+QTD TB Ingested: <strong>{bronze_tb_total:.1f} TB</strong>.
+Regional coverage: <strong>{play_detail["bronze"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+<div class="risk-box">
+<strong>Risk Summary ({bronze_risk["at_risk"]} of {bronze_risk["total"]} use cases, {fmt_currency(bronze_risk["acv_at_risk"])} ACV at risk):</strong><br>
+{bronze_risk["narrative_html"]}
+</div>
+
+<h4 style="color: #555;">Snowflake Intelligence (AI: Snowflake Intelligence &amp; Agents)</h4>
+<p>SI has deployed <strong>{fmt_currency(si_dep["acv"])}</strong> ({si_dep["count"]} UCs) QTD
+with <strong>{fmt_currency(si_open["acv"])}</strong> ({si_open["count"]} UCs) in open pipeline.
+Deployed target: <strong>{si_target}</strong>. Gap to target: <strong>{si_gap}</strong>.
+Regional coverage: <strong>{play_detail["si"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+<p>Theater SI Usage (Last 30 Days): {si_theater["accounts"]:,} Accounts | {si_theater["users"]:,} Users | {si_theater["credits"]:,} Credits | {fmt_currency(si_theater["revenue"])} Revenue.</p>
+<div class="risk-box">
+<strong>Risk Summary ({si_risk["at_risk"]} of {si_risk["total"]} use cases, {fmt_currency(si_risk["acv_at_risk"])} ACV at risk):</strong><br>
+{si_risk["narrative_html"]}
+</div>
+
+<h4 style="color: #555;">SQL Server Migration (Modernize Your Data Estate)</h4>
+<p>SQL Server has deployed <strong>{fmt_currency(sql_dep["acv"])}</strong> ({sql_dep["count"]} UCs) QTD
+with <strong>{fmt_currency(sql_open["acv"])}</strong> ({sql_open["count"]} UCs) in open pipeline.
+Deployed target: <strong>{sqlserver_target}</strong>. Gap to target: <strong>{sqlserver_gap}</strong>.
+Regional coverage: <strong>{play_detail["sqlserver"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+<div class="risk-box">
+<strong>Risk Summary ({sql_risk["at_risk"]} of {sql_risk["total"]} use cases, {fmt_currency(sql_risk["acv_at_risk"])} ACV at risk):</strong><br>
+{sql_risk["narrative_html"]}
+</div>
+
+</div>
+
+<div style="margin-top: 16px; text-align: right;">
+  <button onclick="copyScript()" style="padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em;">Copy Script to Clipboard</button>
+</div>
+"""
+
     html_out = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -3030,6 +3378,7 @@ def build_html(data):
   <button class="tab-btn active" onclick="switchTab('tab-wins', this)">Use Case Wins</button>
   <button class="tab-btn" onclick="switchTab('tab-qc', this)">Use Case Go-Lives</button>
   <button class="tab-btn" onclick="switchTab('tab-forecast', this)">Forecast Analysis</button>
+  <button class="tab-btn" onclick="switchTab('tab-script', this)">Script</button>
 </div>
 
 <div class="tab-content active" id="tab-wins">
@@ -3368,6 +3717,10 @@ def build_html(data):
 {_build_forecast_tab(forecast_analysis, forecasts, deployed, day_number, week_number)}
 </div><!-- end tab-forecast -->
 
+<div class="tab-content" id="tab-script">
+{script_html}
+</div><!-- end tab-script -->
+
 <div class="footer">
   Generated: {today_str} | Data as of: {today_str}
 </div>
@@ -3378,6 +3731,20 @@ function switchTab(tabId, btn) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById(tabId).classList.add('active');
   btn.classList.add('active');
+}}
+function copyScript() {{
+  var el = document.querySelector('#tab-script .qc-script-body');
+  if (!el) el = document.querySelector('#tab-script div[style]');
+  var range = document.createRange();
+  range.selectNodeContents(el);
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  document.execCommand('copy');
+  sel.removeAllRanges();
+  var btn = event.target;
+  btn.textContent = 'Copied!';
+  setTimeout(function() {{ btn.textContent = 'Copy Script to Clipboard'; }}, 2000);
 }}
 </script>
 
@@ -3415,6 +3782,7 @@ def main():
         play_use_cases = q_play_use_cases(conn)
         pacing = q_prior_fy_pacing(conn, fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"])
         play_risk = q_play_risk_detail(conn)
+        high_risk_ucs = q_high_risk_use_cases(conn)
 
         # --- Wins tab queries ---
         wins_forecasts = q_wins_forecast_calls(conn)
@@ -3425,6 +3793,9 @@ def main():
         wins_play_summary = q_wins_play_summary(conn)
         wins_play_use_cases = q_wins_play_use_cases(conn)
         play_targets = q_play_targets(conn)
+        partner_sd = q_partner_sd_attach(conn)
+        uc_velocity = q_use_case_velocity(conn)
+        bronze_created = q_bronze_created_qtd(conn)
 
         # Set day_number in CONFIG for velocity query
         CONFIG["day_number"] = int(fiscal["DAY_NUMBER"])
@@ -3534,6 +3905,7 @@ def main():
             "play_detail": play_detail,
             "play_use_cases": play_use_cases,
             "play_risk": play_risk,
+            "high_risk_ucs": high_risk_ucs,
             "consumption": consumption,
             "bronze_tb_total": bronze_tb_total,
             "bronze_tb_acct": bronze_tb_acct,
@@ -3550,6 +3922,9 @@ def main():
             "wins_play_summary": wins_play_summary,
             "wins_play_use_cases": wins_play_use_cases,
             "play_targets": play_targets,
+            "partner_sd": partner_sd,
+            "uc_velocity": uc_velocity,
+            "bronze_created": bronze_created,
         }
 
         html_content, quarter = build_html(data)
