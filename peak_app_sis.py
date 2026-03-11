@@ -84,12 +84,28 @@ CONFIG = {
     "raven_uc_table": "SALES.RAVEN.USE_CASE_EXPLORER_VH_DELIVERABLE_C",
     "raven_acct_table": "SALES.RAVEN.D_SALESFORCE_ACCOUNT_CUSTOMERS",
     "dim_uc_table": "(SELECT * FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS WHERE DS = (SELECT MAX(DS) FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS))",
+    "vivun_table": "SALES.SE_REPORTING.VIVUN_DELIVERABLES_DAILY_DS",
 }
 
 RISK_CATEGORIES = [
     "Technical Fit", "Time / Resources", "Competitor",
     "Access to the Customer", "Performance", "Consumption",
 ]
+
+# GVP to theater name mapping
+GVP_THEATER_MAP = {
+    "Mark Fleming": "AMSExpansion",
+    "Jennifer Chronis": "USMajors",
+    "Jonathan Beaulier": "USPubSec",
+    "Keegan Riley": "AMSAcquisition",
+    "Jon Robertson": "APJ",
+    "Dayne Turbitt": "EMEA",
+}
+
+
+def _theater():
+    """Return the theater name for the current GVP."""
+    return GVP_THEATER_MAP.get(CONFIG["gvp_name"], CONFIG["gvp_name"])
 
 
 # =============================================================================
@@ -205,9 +221,11 @@ def update_risk_thresholds_from_velocity(velocity):
     tw = velocity["current"].get("time_to_tw")
     imp = velocity["current"].get("won_to_imp_start")
     dep = velocity["current"].get("won_to_deployed")
-    tw = int(round(tw)) if tw is not None and not _is_nan(tw) else CONFIG["days_to_tw"]
-    imp = int(round(imp)) if imp is not None and not _is_nan(imp) else CONFIG["days_to_imp"]
-    dep = int(round(dep)) if dep is not None and not _is_nan(dep) else CONFIG["days_to_deploy"]
+    # Fall back to prior quarter, then CONFIG defaults
+    prior = velocity.get("prior", {})
+    tw = int(round(tw)) if tw is not None and not _is_nan(tw) else (int(round(prior.get("time_to_tw"))) if prior.get("time_to_tw") is not None and not _is_nan(prior.get("time_to_tw")) else CONFIG["days_to_tw"])
+    imp = int(round(imp)) if imp is not None and not _is_nan(imp) else (int(round(prior.get("won_to_imp_start"))) if prior.get("won_to_imp_start") is not None and not _is_nan(prior.get("won_to_imp_start")) else CONFIG["days_to_imp"])
+    dep = int(round(dep)) if dep is not None and not _is_nan(dep) else (int(round(prior.get("won_to_deployed"))) if prior.get("won_to_deployed") is not None and not _is_nan(prior.get("won_to_deployed")) else CONFIG["days_to_deploy"])
     CONFIG["days_to_tw"] = tw
     CONFIG["days_to_imp"] = imp
     CONFIG["days_to_deploy"] = dep
@@ -223,14 +241,33 @@ def update_risk_thresholds_from_velocity(velocity):
 # =============================================================================
 
 def q_fiscal_calendar():
+    # Snowflake fiscal year starts Feb 1. Compute inline to avoid dependency on CORE_FISCAL_DATES.
     rows = run_query("""
-        SELECT FISCAL_QUARTER, FISCAL_YEAR, FQ_START, FQ_END,
-               DATEDIFF('day', CURRENT_DATE(), FQ_END) + 1 as DAYS_REMAINING,
-               DATEDIFF('day', FQ_START, CURRENT_DATE()) + 1 as DAY_NUMBER,
-               WEEK_OF_FQ as WEEK_NUMBER
-        FROM SALES.REPORTING.CORE_FISCAL_DATES
-        WHERE DATE_ = CURRENT_DATE()
-        LIMIT 1
+        SELECT
+            CASE
+                WHEN MONTH(CURRENT_DATE()) >= 2 THEN YEAR(CURRENT_DATE()) + 1
+                ELSE YEAR(CURRENT_DATE())
+            END AS FISCAL_YEAR,
+            CASE
+                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN 'Q1'
+                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN 'Q2'
+                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN 'Q3'
+                ELSE 'Q4'
+            END AS FISCAL_QUARTER,
+            CASE
+                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 2, 1)
+                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 5, 1)
+                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 8, 1)
+                WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 11, 1)
+                ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()) - 1, 11, 1)
+            END AS FQ_START,
+            CASE
+                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 4, 30)
+                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 7, 31)
+                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 10, 31)
+                WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()) + 1, 1, 31)
+                ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 1, 31)
+            END AS FQ_END
     """)
     assert len(rows) == 1, f"Expected 1 fiscal calendar row, got {len(rows)}"
     fiscal = rows[0]
@@ -243,17 +280,32 @@ def q_fiscal_calendar():
     CONFIG["fiscal_year_label"] = f"FY{fy % 100}"
     CONFIG["prior_fy_label"] = f"FY{(fy - 1) % 100}"
 
-    prior_rows = run_query(f"""
-        SELECT DISTINCT FQ_START, FQ_END
-        FROM SALES.REPORTING.CORE_FISCAL_DATES
-        WHERE FISCAL_YEAR = {fy - 1}
-        ORDER BY FQ_START
+    # Compute day/week number
+    day_number = None
+    week_number = None
+    day_rows = run_query(f"""
+        SELECT DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1 AS DAY_NUMBER,
+               CEIL((DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1) / 7.0) AS WEEK_NUMBER
     """)
-    prior_quarters = []
-    for r in prior_rows:
-        qs = safe_str(r["FQ_START"]).strip('"')
-        qe = safe_str(r["FQ_END"]).strip('"')
-        prior_quarters.append((qs, qe))
+    if day_rows:
+        day_number = safe_int(day_rows[0].get("DAY_NUMBER", 0))
+        week_number = safe_int(day_rows[0].get("WEEK_NUMBER", 0))
+    fiscal["DAY_NUMBER"] = day_number
+    fiscal["WEEK_NUMBER"] = week_number
+    fiscal["DAYS_REMAINING"] = None
+    dr_rows = run_query(f"SELECT DATEDIFF('day', CURRENT_DATE(), '{fq_end}'::DATE) + 1 AS DAYS_REMAINING")
+    if dr_rows:
+        fiscal["DAYS_REMAINING"] = safe_int(dr_rows[0].get("DAYS_REMAINING", 0))
+        CONFIG["days_remaining"] = fiscal["DAYS_REMAINING"]
+
+    # Prior FY quarters: FY starts Feb 1, so prior FY = fy-1
+    prior_fy_start_year = fy - 2  # calendar year when prior FY starts (Feb)
+    prior_quarters = [
+        (f"{prior_fy_start_year}-02-01", f"{prior_fy_start_year}-04-30"),
+        (f"{prior_fy_start_year}-05-01", f"{prior_fy_start_year}-07-31"),
+        (f"{prior_fy_start_year}-08-01", f"{prior_fy_start_year}-10-31"),
+        (f"{prior_fy_start_year}-11-01", f"{prior_fy_start_year + 1}-01-31"),
+    ]
     CONFIG["prior_fy_quarters"] = prior_quarters
 
     if prior_quarters:
@@ -410,7 +462,7 @@ def q_deployment_velocity():
                     THEN h.USE_CASE_EACV ELSE 0 END) as V30
             FROM {snapshot_table} h
             WHERE h.DS = {snap_date}
-              AND h.ACCOUNT_GVP = '{CONFIG["gvp_name"]}'
+              AND h.THEATER_NAME = '{_theater()}'
               AND h.USE_CASE_EACV > 0
         """)
         if hist_rows and (float(hist_rows[0].get("V7", 0) or 0) > 0 or float(hist_rows[0].get("V30", 0) or 0) > 0):
@@ -430,9 +482,9 @@ def q_risk_adjusted_pipeline_detail():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
     return run_query(f"""
         WITH fiscal_qtr AS (
-            SELECT FQ_START, FQ_END,
-                   DATEDIFF('day', CURRENT_DATE(), FQ_END) + 1 as DAYS_REMAINING
-            FROM SALES.REPORTING.CORE_FISCAL_DATES WHERE DATE_ = CURRENT_DATE()
+            SELECT '{CONFIG["quarter_start"]}'::DATE AS FQ_START,
+                   '{CONFIG["quarter_end"]}'::DATE AS FQ_END,
+                   DATEDIFF('day', CURRENT_DATE(), '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
         )
         SELECT u.USE_CASE_ID, u.USE_CASE_NAME, u.ACCOUNT_NAME, r.USE_CASE_ACV as USE_CASE_EACV,
                u.STAGE_NUMBER, r.USE_CASE_STAGE, u.DAYS_IN_STAGE, r.GO_LIVE_DATE,
@@ -476,9 +528,9 @@ def q_pipeline_risk():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
     rows = run_query(f"""
         WITH fiscal_qtr AS (
-            SELECT FQ_START, FQ_END,
-                   DATEDIFF('day', CURRENT_DATE(), FQ_END) + 1 as DAYS_REMAINING
-            FROM SALES.REPORTING.CORE_FISCAL_DATES WHERE DATE_ = CURRENT_DATE()
+            SELECT '{CONFIG["quarter_start"]}'::DATE AS FQ_START,
+                   '{CONFIG["quarter_end"]}'::DATE AS FQ_END,
+                   DATEDIFF('day', CURRENT_DATE(), '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
         )
         SELECT
             CASE
@@ -755,6 +807,77 @@ def q_si_usage(account_ids):
     return {r["ACCOUNT_ID"]: r for r in rows}
 
 
+def _create_cc_temp_table():
+    """No longer needed - using pre-populated CC_USAGE_CACHE table."""
+    return True, -1, None
+
+
+def q_cortex_code_theater_usage():
+    """Cortex Code usage across ALL accounts with open pipeline go-lives in the quarter."""
+    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+    try:
+        # Step 1: Get all go-live account IDs
+        acct_rows = run_query(f"""
+            SELECT DISTINCT u.VH_ACCOUNT_C as ACCOUNT_ID
+            FROM {CONFIG["raven_uc_table"]} u
+            JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+            WHERE a.GVP = '{CONFIG["gvp_name"]}'
+              AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
+              AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+              AND u.USE_CASE_STAGE NOT IN ({excluded})
+        """)
+        go_live_ids = [str(r["ACCOUNT_ID"]) for r in acct_rows if r.get("ACCOUNT_ID")]
+        total_accounts = len(go_live_ids)
+        if not go_live_ids:
+            return {"total_accounts": 0, "cc_accounts": 0, "pct": 0, "avg_users": 0, "requests": 0, "credits": 0}
+        # Step 2: Query CC cache table
+        id_list = ", ".join(f"'{aid}'" for aid in go_live_ids)
+        rows = run_query(f"""
+            SELECT
+                COUNT(DISTINCT SALESFORCE_ACCOUNT_ID) as CC_ACCOUNTS,
+                COALESCE(ROUND(AVG(AVG_DAILY_USERS), 1), 0) as AVG_USERS_PER_ACCT,
+                COALESCE(SUM(TOTAL_REQUESTS), 0) as TOTAL_CC_REQUESTS,
+                COALESCE(SUM(ACTUAL_CREDITS), 0) as TOTAL_CC_CREDITS
+            FROM SNOWPUBLIC.STREAMLIT.CC_USAGE_CACHE
+            WHERE SALESFORCE_ACCOUNT_ID IN ({id_list})
+              AND TOTAL_REQUESTS > 0
+        """)
+        r = rows[0] if rows else {}
+        cc_accounts = safe_int(r.get("CC_ACCOUNTS", 0))
+        return {
+            "total_accounts": total_accounts,
+            "cc_accounts": cc_accounts,
+            "pct": round(cc_accounts / total_accounts * 100, 1) if total_accounts else 0,
+            "avg_users": safe_float(r.get("AVG_USERS_PER_ACCT", 0)),
+            "requests": safe_int(r.get("TOTAL_CC_REQUESTS", 0)),
+            "credits": round(safe_float(r.get("TOTAL_CC_CREDITS", 0)), 0),
+        }
+    except Exception as e:
+        return {"total_accounts": 0, "cc_accounts": 0, "pct": 0, "avg_users": 0, "requests": 0, "credits": 0, "error": str(e)}
+
+
+def q_cortex_code_by_account(account_ids):
+    """Cortex Code usage per account for use case tables."""
+    if not account_ids:
+        return {}
+    id_list = ", ".join(f"'{aid}'" for aid in account_ids if aid)
+    if not id_list:
+        return {}
+    try:
+        rows = run_query(f"""
+            SELECT SALESFORCE_ACCOUNT_ID as ACCOUNT_ID,
+                   AVG_DAILY_USERS as CC_USERS,
+                   TOTAL_REQUESTS as CC_REQUESTS,
+                   ROUND(ACTUAL_CREDITS, 1) as CC_CREDITS
+            FROM SNOWPUBLIC.STREAMLIT.CC_USAGE_CACHE
+            WHERE SALESFORCE_ACCOUNT_ID IN ({id_list})
+              AND TOTAL_REQUESTS > 0
+        """)
+    except Exception:
+        return {}
+    return {r["ACCOUNT_ID"]: r for r in rows}
+
+
 def q_bronze_tb_by_account():
     rows = run_query(f"""
         SELECT SALESFORCE_ACCOUNT_ID as ACCOUNT_ID, SALESFORCE_ACCOUNT_NAME as ACCOUNT_NAME,
@@ -831,10 +954,10 @@ def q_play_risk_detail():
 
 
 def q_play_targets():
-    rows = run_query("""
+    rows = run_query(f"""
         SELECT PRIORITIZED_FEATURE_UC, TARGET_USE_CASE_EACV, TARGET_USE_CASE_COUNT
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
-        WHERE MAPPED_THEATER = 'AMSExpansion'
+        WHERE MAPPED_THEATER = '{_theater()}'
           AND FISCAL_QUARTER = 'FY2027-Q1'
           AND MOVEMENT_TYPE = 'Deployed'
           AND PRIORITIZED_FEATURE_UC IN (
@@ -872,6 +995,16 @@ def q_partner_sd_attach():
           AND u.USE_CASE_STAGE NOT IN ({excluded})
         GROUP BY u.IMPLEMENTER_C
     """)
+    # Also get distinct account IDs per implementer category for CC cross-reference
+    acct_rows = run_query(f"""
+        SELECT DISTINCT u.VH_ACCOUNT_C as ACCOUNT_ID, u.IMPLEMENTER_C
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
+          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+          AND u.USE_CASE_STAGE NOT IN ({excluded})
+    """)
     total_acv = total_count = partner_acv = partner_count = sd_acv = sd_count = 0
     unassisted_acv = unassisted_count = 0
     partner_values = {"Partner Only", "Partner Prime + Snowflake SD", "Snowflake SD Prime + Partner"}
@@ -895,12 +1028,57 @@ def q_partner_sd_attach():
             unassisted_count += cnt
     partner_rate = (partner_acv / total_acv * 100) if total_acv else 0
     sd_rate = (sd_acv / total_acv * 100) if total_acv else 0
+    # Collect account IDs by implementer category
+    partner_accounts = set()
+    sd_accounts = set()
+    for r in acct_rows:
+        impl = r.get("IMPLEMENTER_C") or ""
+        aid = r.get("ACCOUNT_ID")
+        if aid:
+            if impl in partner_values:
+                partner_accounts.add(aid)
+            if impl in sd_values:
+                sd_accounts.add(aid)
+    partner_or_ps_accounts = partner_accounts | sd_accounts
+    # Query CC cache directly for partner/PS accounts
+    pps_cc_count = 0
+    if partner_or_ps_accounts:
+        pps_id_list = ", ".join(f"'{aid}'" for aid in partner_or_ps_accounts)
+        try:
+            cc_rows = run_query(f"""
+                SELECT COUNT(DISTINCT SALESFORCE_ACCOUNT_ID) as CC_COUNT
+                FROM SNOWPUBLIC.STREAMLIT.CC_USAGE_CACHE
+                WHERE SALESFORCE_ACCOUNT_ID IN ({pps_id_list})
+                  AND TOTAL_REQUESTS > 0
+            """)
+            pps_cc_count = safe_int(cc_rows[0]["CC_COUNT"]) if cc_rows else 0
+        except Exception:
+            pps_cc_count = 0
     return {
         "total_acv": total_acv, "total_count": total_count,
         "partner_acv": partner_acv, "partner_count": partner_count, "partner_rate": partner_rate,
         "sd_acv": sd_acv, "sd_count": sd_count, "sd_rate": sd_rate,
         "unassisted_acv": unassisted_acv, "unassisted_count": unassisted_count,
+        "partner_or_ps_accounts": len(partner_or_ps_accounts),
+        "partner_or_ps_cc_count": pps_cc_count,
     }
+
+
+def q_pipeline_movements():
+    """7-day pipeline movement metrics from pre-populated cache table.
+    Cache is built from vivun daily snapshots (SALES.SE_REPORTING) which
+    are not accessible in SiS. Refresh cache from CLI before each QC call."""
+    gvp = CONFIG["gvp_name"]
+    rows = run_query(f"SELECT METRIC, CNT, ACV FROM SNOWPUBLIC.STREAMLIT.PIPELINE_MOVEMENTS_CACHE WHERE GVP = '{gvp}'")
+    result = {}
+    for r in rows:
+        m = r.get("METRIC", "")
+        result[m] = {"count": safe_int(r.get("CNT", 0)), "acv": safe_float(r.get("ACV", 0))}
+    # Ensure all keys exist
+    for key in ("won_to_imp", "won_to_lost", "pushed_out", "pulled_in", "imp_started", "new_pipeline"):
+        if key not in result:
+            result[key] = {"count": 0, "acv": 0}
+    return result
 
 
 def q_use_case_velocity():
@@ -914,12 +1092,17 @@ def q_use_case_velocity():
         return {"time_to_tw": None, "won_to_imp_start": None, "won_to_deployed": None}
 
     prior_quarters = CONFIG.get("prior_fy_quarters", [])
+    # DIM_USE_CASE_HISTORY_DS.TIME_WON_TO_DEPLOYED is stale — snapshot not refreshed since 2026-01-13.
+    # Use raven IMPLEMENTATION_START_DATE → DEFAULT_DATE (deployed) for imp-to-deployed.
+    # This avoids double-counting in risk thresholds (stage_4 = imp + deploy, stage_5 = deploy).
     unions = [f"""
         SELECT 'current' as PERIOD,
                AVG(d.TIME_TO_TECH_WIN) as AVG_TW,
                AVG(CASE WHEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) >= 0
                     THEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) END) as AVG_WON_TO_IMP,
-               AVG(d.TIME_WON_TO_DEPLOYED) as AVG_WON_TO_DEPLOYED
+               AVG(CASE WHEN u.IMPLEMENTATION_START_DATE IS NOT NULL AND u.DEFAULT_DATE IS NOT NULL
+                         AND DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) >= 0
+                    THEN DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) END) as AVG_WON_TO_DEPLOYED
         FROM {CONFIG["raven_uc_table"]} u
         JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
         JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
@@ -934,7 +1117,9 @@ def q_use_case_velocity():
                AVG(d.TIME_TO_TECH_WIN) as AVG_TW,
                AVG(CASE WHEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) >= 0
                     THEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) END) as AVG_WON_TO_IMP,
-               AVG(d.TIME_WON_TO_DEPLOYED) as AVG_WON_TO_DEPLOYED
+               AVG(CASE WHEN u.IMPLEMENTATION_START_DATE IS NOT NULL AND u.DEFAULT_DATE IS NOT NULL
+                         AND DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) >= 0
+                    THEN DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) END) as AVG_WON_TO_DEPLOYED
         FROM {CONFIG["raven_uc_table"]} u
         JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
         JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
@@ -959,10 +1144,10 @@ def q_bronze_created_qtd():
           AND u.CREATED_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
     """)
     created = safe_int(created_rows[0]["CREATED_COUNT"]) if created_rows else 0
-    target_rows = run_query("""
+    target_rows = run_query(f"""
         SELECT TARGET_USE_CASE_COUNT
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
-        WHERE MAPPED_THEATER = 'AMSExpansion' AND FISCAL_QUARTER = 'FY2027-Q1'
+        WHERE MAPPED_THEATER = '{_theater()}' AND FISCAL_QUARTER = 'FY2027-Q1'
           AND MOVEMENT_TYPE = 'Created' AND PRIORITIZED_FEATURE_UC = 'Make Your Data AI Ready'
     """)
     target = safe_int(target_rows[0]["TARGET_USE_CASE_COUNT"]) if target_rows and target_rows[0]["TARGET_USE_CASE_COUNT"] else None
@@ -1057,7 +1242,7 @@ def q_historical_conversion_rates(day_number):
             FROM {snapshot_table} h
             LEFT JOIN {CONFIG["raven_uc_table"]} o ON h.USE_CASE_ID = o.ID
             WHERE h.DS = {snap_date}
-              AND h.ACCOUNT_GVP = '{CONFIG["gvp_name"]}'
+              AND h.THEATER_NAME = '{_theater()}'
               AND h.USE_CASE_EACV > 0
         """)
 
@@ -1381,7 +1566,7 @@ def q_backtest_models(hist_rates):
                     THEN h.USE_CASE_EACV ELSE 0 END) as PRE_TW_ACV
             FROM {snapshot_table} h
             WHERE h.DS = {snap_date_str}
-              AND h.ACCOUNT_GVP = '{gvp}' AND h.USE_CASE_EACV > 0
+              AND h.THEATER_NAME = '{_theater()}' AND h.USE_CASE_EACV > 0
         """)
 
     if not unions:
@@ -1536,7 +1721,7 @@ def build_risk_narrative(risk_data):
 # HTML ROW BUILDER
 # =============================================================================
 
-def build_use_case_row(uc, consumption, bronze_tb=None, si_usage=None, row_type="standard"):
+def build_use_case_row(uc, consumption, bronze_tb=None, si_usage=None, cc_by_account=None, row_type="standard"):
     uc_id = safe_str(uc.get("USE_CASE_ID", ""))
     account_id = safe_str(uc.get("ACCOUNT_ID", ""))
     account_name = html_escape(uc.get("ACCOUNT_NAME", ""))
@@ -1584,6 +1769,12 @@ def build_use_case_row(uc, consumption, bronze_tb=None, si_usage=None, row_type=
             revenue = fmt_currency(si_data.get("SI_REVENUE"), compact=False)
             users = safe_int(si_data.get("SI_USERS", 0) or 0)
             col1_lines.append(f'<br>\n    <span class="si-metrics">SI 30D: {credits} Credits | {revenue} | {users} Users</span>')
+    if cc_by_account:
+        cc_data = cc_by_account.get(account_id, {})
+        if cc_data:
+            cc_users = safe_float(cc_data.get("CC_USERS", 0) or 0)
+            cc_credits = safe_float(cc_data.get("CC_CREDITS", 0) or 0)
+            col1_lines.append(f'<br>\n    <span class="cc-metrics" style="color: #6f42c1; font-size: 0.85em;">CC CLI 90D: {cc_users:.1f} Avg Daily Users | {cc_credits:,.0f} Credits</span>')
     risk_line_html = ""
     if risk and risk.lower() not in ("none", "", "-"):
         risk_line_html = f'<div class="details-row"><span class="risk"><strong>Risk:</strong> {html_escape(risk)}</span></div>'
@@ -1669,7 +1860,7 @@ def _build_forecast_tab(fa, forecasts, deployed, day_number, week_number):
     parts = f"""
 <h2>Forecast Analysis</h2>
 <p class="summary">Three independent models project Commit, Most Likely, and Stretch calls based on current pipeline state,
-historical pacing, and milestone-based conversion rates. All data is for AMSExpansion / {CONFIG["gvp_name"]} only.</p>
+historical pacing, and milestone-based conversion rates. All data is for {_theater()} / {CONFIG["gvp_name"]} only.</p>
 
 <h3>Current Pipeline State (Day {day_number}, Week {week_number})</h3>
 <div style="margin: 15px 0;">
@@ -1835,7 +2026,7 @@ historical pacing, and milestone-based conversion rates. All data is for AMSExpa
         <strong>Methodology:</strong> M4 weights M1/M2/M3 by inverse historical backtest error.
         Pipeline Risk is bottom-up from current stage data.
         Historical Pacing extrapolates from {prior_fy} deployment velocity. Stage Conversion applies milestone-based conversion rates
-        with a new-pipeline uplift factor. All data is AMSExpansion-specific.
+        with a new-pipeline uplift factor. All data is {_theater()}-specific.
     </div>
   </div>
 
@@ -1993,7 +2184,7 @@ PLAY_OPTIONS = {
 
 def _run_all_queries(gvp_name):
     CONFIG["gvp_name"] = gvp_name
-    total_steps = 28
+    total_steps = 30
     completed = [0]
     progress = st.progress(0, text="Connecting to Snowflake...")
 
@@ -2039,6 +2230,8 @@ def _run_all_queries(gvp_name):
     play_targets = q_play_targets()
     _tick("Partner/SD attach...")
     partner_sd = q_partner_sd_attach()
+    _tick("Pipeline movements (7d)...")
+    pipeline_movements = q_pipeline_movements()
     _tick("Bronze created...")
     bronze_created = q_bronze_created_qtd()
     _tick("SI theater totals...")
@@ -2072,6 +2265,11 @@ def _run_all_queries(gvp_name):
     consumption = q_consumption(all_account_ids)
     si_usage = q_si_usage(si_account_ids)
 
+    # Cortex Code usage
+    _tick("Cortex Code usage...")
+    cc_theater = q_cortex_code_theater_usage()
+    cc_by_account = q_cortex_code_by_account(all_account_ids)
+
     _tick("Forecast models...")
     forecast_analysis = compute_forecast_analysis(
         pipeline_phases, hist_conv_rates, deployed, risk_analysis,
@@ -2099,7 +2297,8 @@ def _run_all_queries(gvp_name):
         "si_usage": si_usage, "si_theater": si_theater, "pacing": pacing,
         "forecast_analysis": forecast_analysis, "play_targets": play_targets,
         "partner_sd": partner_sd, "uc_velocity": uc_velocity,
-        "bronze_created": bronze_created,
+        "bronze_created": bronze_created, "pipeline_movements": pipeline_movements,
+        "cc_theater": cc_theater, "cc_by_account": cc_by_account,
         "_config": {
             "gvp_name": CONFIG.get("gvp_name"),
             "quarter_start": CONFIG.get("quarter_start"),
@@ -2267,6 +2466,7 @@ def render_script_tab(data, selected_play_key):
     si_theater = data["si_theater"]
     pacing = data["pacing"]
     cfg = data["_config"]
+    pm = data.get("pipeline_movements", {})
 
     most_likely = forecasts["most_likely"]
     gl_target = forecasts["target"]
@@ -2294,6 +2494,10 @@ def render_script_tab(data, selected_play_key):
     unassisted_acv = partner_sd.get("unassisted_acv", 0)
     unassisted_cnt = partner_sd.get("unassisted_count", 0)
     unassisted_rate = (unassisted_acv / partner_sd.get("total_acv", 1) * 100) if partner_sd.get("total_acv") else 0
+    # CC CLI adoption for partner/PS-attached accounts (pre-computed in query)
+    partner_ps_total = partner_sd.get("partner_or_ps_accounts", 0)
+    partner_ps_cc = partner_sd.get("partner_or_ps_cc_count", 0)
+    partner_ps_cc_pct = round(partner_ps_cc / partner_ps_total * 100, 1) if partner_ps_total else 0
     uc_vel_cur = uc_velocity.get("current", {})
     uc_vel_prior = uc_velocity.get("prior", {})
     v_tw = uc_vel_cur.get("time_to_tw")
@@ -2314,17 +2518,28 @@ def render_script_tab(data, selected_play_key):
     v_dep_prior = _vel_prior_sub(v_dep, uc_vel_prior.get("won_to_deployed"))
     high_risk_table_html = build_high_risk_table_html(high_risk_ucs)
 
+    # Pipeline movement variables (7-day)
+    _pm_empty = {"count": 0, "acv": 0}
+    pm_won_to_imp = pm.get("won_to_imp", _pm_empty)
+    pm_won_to_lost = pm.get("won_to_lost", _pm_empty)
+    pm_pushed_out = pm.get("pushed_out", _pm_empty)
+    pm_pulled_in = pm.get("pulled_in", _pm_empty)
+    pm_imp_started = pm.get("imp_started", _pm_empty)
+    pm_new_pipeline = pm.get("new_pipeline", _pm_empty)
+
     script_html = f"""
 <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 24px; font-family: Georgia, serif; font-size: 1.05em; line-height: 1.7;">
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Forecast Call</h3>
-<p>For AMSExpansion, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}.
+<p>For {_theater()}, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}.
 We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a target of <strong>{fmt_currency(gl_target)}</strong> (<strong>{fmt_pct(deployed_pct_of_target)}</strong> of target).
 Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
-<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Risk</h3>
-<p>Total pipeline risk stands at <strong>{fmt_currency(total_risk_acv)}</strong>, leaving
-<strong>{fmt_currency(total_good)}</strong> in good pipeline for <strong>{fmt_pct(good_coverage)}</strong> good coverage vs Most Likely.
-We are currently at <strong>{fmt_pct(deployed_pct_of_target)}</strong> of our go-live target.</p>
-{high_risk_table_html}
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pipeline (Last 7 Days)</h3>
+<p>In the last 7 days, <strong>{pm_pushed_out["count"]}</strong> use cases (<strong>{fmt_currency(pm_pushed_out["acv"])}</strong>) were pushed out of the quarter
+while <strong>{pm_pulled_in["count"]}</strong> (<strong>{fmt_currency(pm_pulled_in["acv"])}</strong>) were pulled in.
+<strong>{pm_imp_started["count"]}</strong> use cases (<strong>{fmt_currency(pm_imp_started["acv"])}</strong>) started implementation with a go-live this quarter &mdash;
+of those, <strong>{pm_won_to_imp["count"]}</strong> (<strong>{fmt_currency(pm_won_to_imp["acv"])}</strong>) were won in prior quarters.
+<strong>{pm_won_to_lost["count"]}</strong> prior-quarter wins (<strong>{fmt_currency(pm_won_to_lost["acv"])}</strong>) were lost.
+Net new pipeline (created in the last 7 days with a current-quarter go-live): <strong>{pm_new_pipeline["count"]}</strong> use cases, <strong>{fmt_currency(pm_new_pipeline["acv"])}</strong>.</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pacing</h3>
 <p>On Day <strong>{day_number}</strong> of the quarter, our current deployed ACV of <strong>{fmt_currency(deployed["acv"])}</strong>
 compares to a prior FY average of <strong>{fmt_currency(day_avg)}</strong> deployed by this day
@@ -2333,21 +2548,6 @@ On a weekly basis (Week <strong>{week_number}</strong>), the prior FY average de
 (<strong>{fmt_pct(week_pct_val)}</strong> of final).</p>
 <p>If the current quarter follows the same deployment curve as the prior FY average,
 our projected quarter-end deployed ACV would be{f" <strong>{fmt_currency(day_projection)}</strong> based on daily pacing" if day_projection else " unavailable (no prior FY daily data)"}{f" and <strong>{fmt_currency(week_projection)}</strong> based on weekly pacing" if week_projection else ""}.</p>
-<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Partner and SD Attach</h3>
-<p>Partner attach rate on the open pipeline is <strong>{fmt_pct(p_rate)}</strong>
-({p_cnt} use cases, {fmt_currency(p_acv)} ACV).
-SD attach rate is <strong>{fmt_pct(sd_rate)}</strong>
-({sd_cnt} use cases, {fmt_currency(sd_acv_val)} ACV).
-The remaining <strong>{unassisted_cnt}</strong> use cases ({fmt_currency(unassisted_acv)} ACV, {fmt_pct(unassisted_rate)}) are unassisted (Customer Only, Unknown, or None).</p>
-<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Use Case Velocity</h3>
-<p>For use cases that went live this quarter, our average velocity metrics are:</p>
-<div class="timeline-box">
-  <div class="timeline-item"><span class="timeline-label">Days to TW</span><span class="timeline-days">{v_tw_str}{v_tw_prior}</span></div>
-  <div class="timeline-arrow">&rarr;</div>
-  <div class="timeline-item"><span class="timeline-label">Days to Imp Start</span><span class="timeline-days">{v_imp_str}{v_imp_prior}</span></div>
-  <div class="timeline-arrow">&rarr;</div>
-  <div class="timeline-item"><span class="timeline-label">Days to Deployed</span><span class="timeline-days">{v_dep_str}{v_dep_prior}</span></div>
-</div>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Sales Play Detail</h3>
 """
     _ps = play_summary
@@ -2369,7 +2569,7 @@ with <strong>{fmt_currency(br_open["acv"])}</strong> ({br_open["count"]} UCs) in
 Gap to deployed target: <strong>{bronze_gap}</strong>.
 We have created <strong>{br_created}</strong> Bronze use cases this quarter against a creation target of <strong>{br_create_target_str}</strong> ({br_create_pct}).
 QTD TB Ingested: <strong>{bronze_tb_total:.1f} TB</strong>.
-Regional coverage: <strong>{play_detail["bronze"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+Regional coverage: <strong>{play_detail["bronze"]["regions"]}</strong> of 8 {_theater()} regions contributing.</p>
 <div class="risk-box">
 <strong>Risk Summary ({bronze_risk["at_risk"]} of {bronze_risk["total"]} use cases, {fmt_currency(bronze_risk["acv_at_risk"])} ACV at risk):</strong><br>
 {bronze_risk["narrative_html"]}
@@ -2386,7 +2586,7 @@ Regional coverage: <strong>{play_detail["bronze"]["regions"]}</strong> of 8 AMSE
 <p>SI has deployed <strong>{fmt_currency(si_dep["acv"])}</strong> ({si_dep["count"]} UCs) QTD
 with <strong>{fmt_currency(si_open["acv"])}</strong> ({si_open["count"]} UCs) in open pipeline.
 Deployed target: <strong>{si_target_str}</strong>. Gap to target: <strong>{si_gap}</strong>.
-Regional coverage: <strong>{play_detail["si"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+Regional coverage: <strong>{play_detail["si"]["regions"]}</strong> of 8 {_theater()} regions contributing.</p>
 <p>Theater SI Usage (Last 30 Days): {si_theater["accounts"]:,} Accounts | {si_theater["users"]:,} Users | {si_theater["credits"]:,} Credits | {fmt_currency(si_theater["revenue"])} Revenue.</p>
 <div class="risk-box">
 <strong>Risk Summary ({si_risk["at_risk"]} of {si_risk["total"]} use cases, {fmt_currency(si_risk["acv_at_risk"])} ACV at risk):</strong><br>
@@ -2404,13 +2604,35 @@ Regional coverage: <strong>{play_detail["si"]["regions"]}</strong> of 8 AMSExpan
 <p>SQL Server has deployed <strong>{fmt_currency(sql_dep["acv"])}</strong> ({sql_dep["count"]} UCs) QTD
 with <strong>{fmt_currency(sql_open["acv"])}</strong> ({sql_open["count"]} UCs) in open pipeline.
 Deployed target: <strong>{sqlserver_target}</strong>. Gap to target: <strong>{sql_gap}</strong>.
-Regional coverage: <strong>{play_detail["sqlserver"]["regions"]}</strong> of 8 AMSExpansion regions contributing.</p>
+Regional coverage: <strong>{play_detail["sqlserver"]["regions"]}</strong> of 8 {_theater()} regions contributing.</p>
 <div class="risk-box">
 <strong>Risk Summary ({sql_risk["at_risk"]} of {sql_risk["total"]} use cases, {fmt_currency(sql_risk["acv_at_risk"])} ACV at risk):</strong><br>
 {sql_risk["narrative_html"]}
 </div>
 """
-    script_html += "\n</div>"
+    script_html += f"""
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Risk</h3>
+<p>Total pipeline risk stands at <strong>{fmt_currency(total_risk_acv)}</strong>, leaving
+<strong>{fmt_currency(total_good)}</strong> in good pipeline for <strong>{fmt_pct(good_coverage)}</strong> good coverage vs Most Likely.
+We are currently at <strong>{fmt_pct(deployed_pct_of_target)}</strong> of our go-live target.</p>
+{high_risk_table_html}
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Partner and SD Attach</h3>
+<p>Partner attach rate on the open pipeline is <strong>{fmt_pct(p_rate)}</strong>
+({p_cnt} use cases, {fmt_currency(p_acv)} ACV).
+SD attach rate is <strong>{fmt_pct(sd_rate)}</strong>
+({sd_cnt} use cases, {fmt_currency(sd_acv_val)} ACV).
+The remaining <strong>{unassisted_cnt}</strong> use cases ({fmt_currency(unassisted_acv)} ACV, {fmt_pct(unassisted_rate)}) are unassisted (Customer Only, Unknown, or None).
+Of the <strong>{partner_ps_total}</strong> accounts with Partner or PS-attached use cases, <strong>{partner_ps_cc}</strong> (<strong>{partner_ps_cc_pct}%</strong>) are actively using Cortex Code CLI.</p>
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Use Case Velocity</h3>
+<p>For use cases that went live this quarter, our average velocity metrics are:</p>
+<div class="timeline-box">
+  <div class="timeline-item"><span class="timeline-label">Days to TW</span><span class="timeline-days">{v_tw_str}{v_tw_prior}</span></div>
+  <div class="timeline-arrow">&rarr;</div>
+  <div class="timeline-item"><span class="timeline-label">Days to Imp Start</span><span class="timeline-days">{v_imp_str}{v_imp_prior}</span></div>
+  <div class="timeline-arrow">&rarr;</div>
+  <div class="timeline-item"><span class="timeline-label">Days to Deployed</span><span class="timeline-days">{v_dep_str}{v_dep_prior}</span></div>
+</div>
+</div>"""
     st.html(STREAMLIT_CSS + script_html)
 
 
@@ -2435,6 +2657,8 @@ def render_golives_tab(data):
     pacing = data["pacing"]
     play_targets = data["play_targets"]
     cfg = data["_config"]
+    cc_theater = data.get("cc_theater", {})
+    cc_by_account = data.get("cc_by_account", {})
 
     quarter = safe_str(fiscal["FISCAL_QUARTER"])
     day_number = safe_int(fiscal["DAY_NUMBER"])
@@ -2456,10 +2680,10 @@ def render_golives_tab(data):
     bronze_risk = build_risk_narrative(play_risk["bronze"])
     si_risk = build_risk_narrative(play_risk["si"])
     sql_risk = build_risk_narrative(play_risk["sqlserver"])
-    top5_rows = "\n".join(build_use_case_row(uc, consumption) for uc in top5)
-    bronze_rows = "\n".join(build_use_case_row(uc, consumption, bronze_tb=bronze_tb_acct, row_type="bronze") for uc in play_use_cases["bronze"])
-    si_rows = "\n".join(build_use_case_row(uc, consumption, si_usage=si_usage, row_type="si") for uc in play_use_cases["si"])
-    sql_rows = "\n".join(build_use_case_row(uc, consumption, row_type="standard") for uc in play_use_cases["sqlserver"])
+    top5_rows = "\n".join(build_use_case_row(uc, consumption, cc_by_account=cc_by_account) for uc in top5)
+    bronze_rows = "\n".join(build_use_case_row(uc, consumption, bronze_tb=bronze_tb_acct, cc_by_account=cc_by_account, row_type="bronze") for uc in play_use_cases["bronze"])
+    si_rows = "\n".join(build_use_case_row(uc, consumption, si_usage=si_usage, cc_by_account=cc_by_account, row_type="si") for uc in play_use_cases["si"])
+    sql_rows = "\n".join(build_use_case_row(uc, consumption, cc_by_account=cc_by_account, row_type="standard") for uc in play_use_cases["sqlserver"])
     day_avg = fmt_currency(pacing["day_avg"])
     day_pct = fmt_pct(pacing["day_pct"])
     week_avg = fmt_currency(pacing["week_avg"])
@@ -2472,6 +2696,13 @@ def render_golives_tab(data):
     sqlserver_gap = fmt_play_gap(play_targets, "sqlserver", play_summary["sqlserver_deployed"]["acv"], play_summary["sqlserver_deployed"]["count"])
     fy_label = cfg.get("fiscal_year_label", "FY27")
     prior_fy_label = cfg.get("prior_fy_label", "FY26")
+    cc_accounts = cc_theater.get("cc_accounts", 0)
+    cc_total_accounts = cc_theater.get("total_accounts", 0)
+    cc_pct = cc_theater.get("pct", 0)
+    cc_avg_users = cc_theater.get("avg_users", 0)
+    cc_requests = cc_theater.get("requests", 0)
+    cc_credits = cc_theater.get("credits", 0)
+    cc_error = cc_theater.get("error", "")
 
     html_content = f"""
 <h3>Revenue &amp; Forecast</h3>
@@ -2543,6 +2774,13 @@ def render_golives_tab(data):
 </table>
 <p style="font-size: 0.85em; color: #666; margin-top: 5px;"><em>{prior_fy_label} Average Final: ${cfg["prior_fy_avg_final"]}M across 4 quarters | {fy_label} {quarter} Most Likely: {fmt_currency(most_likely)}</em></p>
 
+<h3>Cortex Code CLI Usage (Last 90 Days)</h3>
+{"<p style='color:red;'>CC Error: " + cc_error + "</p>" if cc_error else ""}
+<table class="forecast-table" style="width: 750px;">
+  <tr><th>Open Pipeline Accounts</th><th>Using CC CLI</th><th>Adoption %</th><th>Avg Daily Users / Acct</th><th>Requests (90D)</th><th>Credits (90D)</th></tr>
+  <tr><td>{cc_total_accounts}</td><td>{cc_accounts}</td><td>{cc_pct}%</td><td>{cc_avg_users}</td><td>{cc_requests:,}</td><td>{cc_credits:,.0f}</td></tr>
+</table>
+
 <h3>Top 5 Use Cases Going Live This Quarter</h3>
 <table class="use-case-table">
   <tr><th style="width:25%">Account / Use Case</th><th style="width:45%">Details</th><th style="width:30%">Summary</th></tr>
@@ -2561,7 +2799,7 @@ def render_golives_tab(data):
 <h3>Bronze Ingest - Use Cases &ge;$500K</h3>
 <div class="analysis"><strong>QTD TB Ingested:</strong> {bronze_tb_total:.1f} TB<br>
 <strong>Average ACV:</strong> {fmt_currency(play_detail["bronze"]["avg_acv"])} | <strong>Median ACV:</strong> {fmt_currency(play_detail["bronze"]["median_acv"])} | across {play_detail["bronze"]["count"]} use cases.
-<strong>Regional Coverage:</strong> {play_detail["bronze"]["regions"]} of 8 AMSExpansion regions contributing.</div>
+<strong>Regional Coverage:</strong> {play_detail["bronze"]["regions"]} of 8 {_theater()} regions contributing.</div>
 <div class="risk-box"><strong>Risk Summary ({bronze_risk["at_risk"]} of {bronze_risk["total"]} use cases, {fmt_currency(bronze_risk["acv_at_risk"])} ACV at risk):</strong><br>{bronze_risk["narrative_html"]}</div>
 <table class="use-case-table"><tr><th style="width:25%">Account / Use Case</th><th style="width:45%">Details</th><th style="width:30%">Summary</th></tr>{bronze_rows}</table>
 </div>
@@ -2570,7 +2808,7 @@ def render_golives_tab(data):
 <h3>Snowflake Intelligence - Use Cases &ge;$500K</h3>
 <div class="analysis"><strong>Theater SI Usage (Last 30 Days):</strong> {si_theater["accounts"]:,} Accounts | {si_theater["users"]:,} Users | {si_theater["credits"]:,} Credits | {fmt_currency(si_theater["revenue"])} Revenue<br>
 <strong>Average ACV:</strong> {fmt_currency(play_detail["si"]["avg_acv"])} | <strong>Median ACV:</strong> {fmt_currency(play_detail["si"]["median_acv"])} | across {play_detail["si"]["count"]} use cases.
-<strong>Regional Coverage:</strong> {play_detail["si"]["regions"]} of 8 AMSExpansion regions contributing.</div>
+<strong>Regional Coverage:</strong> {play_detail["si"]["regions"]} of 8 {_theater()} regions contributing.</div>
 <div class="risk-box"><strong>Risk Summary ({si_risk["at_risk"]} of {si_risk["total"]} use cases, {fmt_currency(si_risk["acv_at_risk"])} ACV at risk):</strong><br>{si_risk["narrative_html"]}</div>
 <table class="use-case-table"><tr><th style="width:25%">Account / Use Case</th><th style="width:45%">Details</th><th style="width:30%">Summary</th></tr>{si_rows}</table>
 </div>
@@ -2578,7 +2816,7 @@ def render_golives_tab(data):
 <div class="play-section">
 <h3>SQL Server Migration - Use Cases &ge;$500K</h3>
 <div class="analysis"><strong>Average ACV:</strong> {fmt_currency(play_detail["sqlserver"]["avg_acv"])} | <strong>Median ACV:</strong> {fmt_currency(play_detail["sqlserver"]["median_acv"])} | across {play_detail["sqlserver"]["count"]} use cases.
-<strong>Regional Coverage:</strong> {play_detail["sqlserver"]["regions"]} of 8 AMSExpansion regions contributing.</div>
+<strong>Regional Coverage:</strong> {play_detail["sqlserver"]["regions"]} of 8 {_theater()} regions contributing.</div>
 <div class="risk-box"><strong>Risk Summary ({sql_risk["at_risk"]} of {sql_risk["total"]} use cases, {fmt_currency(sql_risk["acv_at_risk"])} ACV at risk):</strong><br>{sql_risk["narrative_html"]}</div>
 <table class="use-case-table"><tr><th style="width:25%">Account / Use Case</th><th style="width:45%">Details</th><th style="width:30%">Summary</th></tr>{sql_rows}</table>
 </div>
