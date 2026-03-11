@@ -8,9 +8,11 @@ into a single standalone file compatible with Snowpark session execution.
 
 import os
 import re
+import time
 import html as html_lib
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
@@ -37,25 +39,44 @@ if _use_snowpark:
         pass  # May not be supported in all contexts
 
 
-def run_query(sql):
-    """Execute SQL and return results as list of dicts (compatible with all existing code)."""
-    if _use_snowpark:
-        df = session.sql(sql).to_pandas()
-    else:
-        cur = session.cursor()
-        cur.execute("USE WAREHOUSE SNOWADHOC")
-        cur.execute(sql)
-        cols = [desc[0] for desc in cur.description]
-        df = pd.DataFrame(cur.fetchall(), columns=cols)
-        cur.close()
-    # Convert DataFrame to list of dicts for compatibility
-    records = df.to_dict("records")
-    # Ensure numeric types are Python native (not numpy)
-    for row in records:
-        for k, v in row.items():
-            if hasattr(v, "item"):
-                row[k] = v.item()
-    return records
+def run_query(sql, _retries=2, _delay=3):
+    """Execute SQL and return results as list of dicts.
+    Retries on transient errors (e.g. view refresh, object not found)."""
+    last_err = None
+    for attempt in range(1 + _retries):
+        try:
+            if _use_snowpark:
+                df = session.sql(sql).to_pandas()
+            else:
+                cur = session.cursor()
+                cur.execute("USE WAREHOUSE SNOWADHOC")
+                cur.execute(sql)
+                cols = [desc[0] for desc in cur.description]
+                df = pd.DataFrame(cur.fetchall(), columns=cols)
+                cur.close()
+            # Convert DataFrame to list of dicts for compatibility
+            records = df.to_dict("records")
+            # Ensure numeric types are Python native (not numpy)
+            for row in records:
+                for k, v in row.items():
+                    if hasattr(v, "item"):
+                        row[k] = v.item()
+            return records
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            # Retry on transient object-not-found / auth errors (view being refreshed)
+            if attempt < _retries and ("does not exist or not authorized" in err_msg
+                                       or "Object does not exist" in err_msg):
+                time.sleep(_delay)
+                # Re-activate secondary roles in case session context was lost
+                if _use_snowpark:
+                    try:
+                        session.sql("USE SECONDARY ROLES ALL").collect()
+                    except Exception:
+                        pass
+                continue
+            raise last_err
 
 
 # =============================================================================
@@ -86,7 +107,6 @@ CONFIG = {
     "raven_uc_table": "SALES.RAVEN.USE_CASE_EXPLORER_VH_DELIVERABLE_C",
     "raven_acct_table": "SALES.RAVEN.D_SALESFORCE_ACCOUNT_CUSTOMERS",
     "dim_uc_table": "(SELECT * FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS WHERE DS = (SELECT MAX(DS) FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS))",
-    "vivun_table": "SALES.SE_REPORTING.VIVUN_DELIVERABLES_DAILY_DS",
 }
 
 RISK_CATEGORIES = [
@@ -281,6 +301,8 @@ def q_fiscal_calendar():
     CONFIG["fiscal_year"] = fy
     CONFIG["fiscal_year_label"] = f"FY{fy % 100}"
     CONFIG["prior_fy_label"] = f"FY{(fy - 1) % 100}"
+    fq_label = safe_str(fiscal.get("FISCAL_QUARTER", "Q1"))
+    CONFIG["fiscal_quarter"] = f"FY{fy}-{fq_label}"
 
     # Compute day/week number
     day_number = None
@@ -961,8 +983,8 @@ def q_play_targets():
         SELECT PRIORITIZED_FEATURE_UC, TARGET_USE_CASE_EACV, TARGET_USE_CASE_COUNT, MOVEMENT_TYPE
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
         WHERE MAPPED_THEATER = '{_theater()}'
-          AND FISCAL_QUARTER = 'FY2027-Q1'
-          AND MOVEMENT_TYPE IN ('Deployed', 'Created')
+AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
+               AND MOVEMENT_TYPE IN ('Deployed', 'Created')
           AND PRIORITIZED_FEATURE_UC IN (
               'Make Your Data AI Ready', 'Modernize Your Data Estate',
               'AI: Snowflake Intelligence & Agents')
@@ -1072,11 +1094,21 @@ def q_partner_sd_attach():
 
 
 def q_pipeline_movements():
-    """7-day pipeline movement metrics from pre-populated cache table.
-    Cache is built from vivun daily snapshots (SALES.SE_REPORTING) which
-    are not accessible in SiS. Refresh cache from CLI before each QC call."""
+    """7-day pipeline movement metrics from pre-computed cache table.
+    Cache is built from MDM.MDM_INTERFACES.DIM_USE_CASE_DAILY using day-over-day
+    LAG comparison to detect actual field-level changes.
+    Pushed out  = go-live was in current FQ, now moved past FQ end.
+    Pulled in   = go-live was outside current FQ, now moved into FQ.
+    Won to lost = stage changed to lost/not-in-pursuit (had go-live in FQ).
+    Imp started = stage moved into Implementation In Progress (go-live in FQ).
+    Won to imp  = stage moved from Won to Implementation (go-live in FQ).
+    Net new     = UC created in last 7 days with go-live in FQ."""
     gvp = CONFIG["gvp_name"]
-    rows = run_query(f"SELECT METRIC, CNT, ACV FROM SNOWPUBLIC.STREAMLIT.PIPELINE_MOVEMENTS_CACHE WHERE GVP = '{gvp}'")
+    rows = run_query(f"""
+        SELECT METRIC, CNT, ACV
+        FROM SNOWPUBLIC.STREAMLIT.PIPELINE_MOVEMENTS_CACHE
+        WHERE ACCOUNT_GVP = '{gvp}'
+    """)
     result = {}
     for r in rows:
         m = r.get("METRIC", "")
@@ -1154,7 +1186,7 @@ def q_bronze_created_qtd():
     target_rows = run_query(f"""
         SELECT TARGET_USE_CASE_COUNT
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
-        WHERE MAPPED_THEATER = '{_theater()}' AND FISCAL_QUARTER = 'FY2027-Q1'
+        WHERE MAPPED_THEATER = '{_theater()}' AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
           AND MOVEMENT_TYPE = 'Created' AND PRIORITIZED_FEATURE_UC = 'Make Your Data AI Ready'
     """)
     target = safe_int(target_rows[0]["TARGET_USE_CASE_COUNT"]) if target_rows and target_rows[0]["TARGET_USE_CASE_COUNT"] else None
@@ -2200,12 +2232,12 @@ PLAY_OPTIONS = {
 
 
 # =============================================================================
-# DATA LOADING (sequential, no ThreadPoolExecutor)
+# DATA LOADING (parallel with ThreadPoolExecutor)
 # =============================================================================
 
 def _run_all_queries(gvp_name):
     CONFIG["gvp_name"] = gvp_name
-    total_steps = 30
+    total_steps = 10
     completed = [0]
     progress = st.progress(0, text="Connecting to Snowflake...")
 
@@ -2213,67 +2245,96 @@ def _run_all_queries(gvp_name):
         completed[0] += 1
         progress.progress(min(completed[0] / total_steps, 1.0), text=label)
 
-    _tick("Phase 1: Fiscal calendar...")
+    # --- Phase 0: Sequential setup (sets CONFIG values needed by later queries) ---
+    _tick("Fiscal calendar & velocity...")
     fiscal = q_fiscal_calendar()
     CONFIG["day_number"] = safe_int(fiscal["DAY_NUMBER"])
-
-    _tick("Phase 1.5: Use case velocity...")
     uc_velocity = q_use_case_velocity()
     update_risk_thresholds_from_velocity(uc_velocity)
 
-    _tick("QTD revenue...")
-    revenue = q_qtd_revenue()
-    _tick("Forecast calls...")
-    forecasts = q_forecast_calls()
-    _tick("Deployed QTD...")
-    deployed = q_deployed_qtd()
-    _tick("Last 7 days...")
-    last7 = q_last7_deployed()
-    _tick("Open pipeline...")
-    pipeline = q_open_pipeline()
-    _tick("Pipeline risk...")
-    risk_analysis = q_pipeline_risk()
-    _tick("Top 5 use cases...")
-    top5 = q_top5_use_cases()
-    _tick("Sales play summary...")
-    play_summary = q_sales_play_summary()
-    _tick("Play detail metrics...")
-    play_detail = q_play_detail_metrics()
-    _tick("Bronze TB total...")
-    bronze_tb_total = q_bronze_tb_total()
-    _tick("Play use cases...")
-    play_use_cases = q_play_use_cases()
-    _tick("Play risk detail...")
-    play_risk = q_play_risk_detail()
-    _tick("High risk UCs (Cortex AI)...")
-    high_risk_ucs = q_high_risk_use_cases()
-    _tick("Play targets...")
-    play_targets = q_play_targets()
-    _tick("Partner/SD attach...")
-    partner_sd = q_partner_sd_attach()
-    _tick("Pipeline movements (7d)...")
-    pipeline_movements = q_pipeline_movements()
-    _tick("Bronze created...")
-    bronze_created = q_bronze_created_qtd()
-    _tick("SI created...")
-    si_created = q_si_created_qtd()
-    _tick("SI theater totals...")
-    si_theater = q_si_theater_totals()
-    _tick("Bronze TB by account...")
-    bronze_tb_acct = q_bronze_tb_by_account()
-    _tick("Deployment velocity...")
-    velocity = q_deployment_velocity()
-    _tick("Risk-adjusted pipeline...")
-    pipeline_detail = q_risk_adjusted_pipeline_detail()
-    _tick("Pipeline phases...")
-    pipeline_phases = q_current_pipeline_phases()
-    _tick("Pacing...")
-    pacing = q_prior_fy_pacing(fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"])
-    _tick("Historical conversion rates...")
-    hist_conv_rates = q_historical_conversion_rates(fiscal["DAY_NUMBER"])
+    # --- Phase 1: Parallel independent queries ---
+    _tick("Loading data (parallel)...")
+    phase1_queries = {
+        "revenue": q_qtd_revenue,
+        "forecasts": q_forecast_calls,
+        "deployed": q_deployed_qtd,
+        "last7": q_last7_deployed,
+        "pipeline": q_open_pipeline,
+        "risk_analysis": q_pipeline_risk,
+        "top5": q_top5_use_cases,
+        "play_summary": q_sales_play_summary,
+        "play_detail": q_play_detail_metrics,
+        "bronze_tb_total": q_bronze_tb_total,
+        "play_use_cases": q_play_use_cases,
+        "play_risk": q_play_risk_detail,
+        "high_risk_ucs": q_high_risk_use_cases,
+        "play_targets": q_play_targets,
+        "partner_sd": q_partner_sd_attach,
+        "pipeline_movements": q_pipeline_movements,
+        "bronze_created": q_bronze_created_qtd,
+        "si_created": q_si_created_qtd,
+        "si_theater": q_si_theater_totals,
+        "bronze_tb_acct": q_bronze_tb_by_account,
+        "velocity": q_deployment_velocity,
+        "pipeline_detail": q_risk_adjusted_pipeline_detail,
+        "pipeline_phases": q_current_pipeline_phases,
+        "cc_theater": q_cortex_code_theater_usage,
+    }
+    # Queries that need fiscal calendar results
+    phase1_with_args = {
+        "pacing": lambda: q_prior_fy_pacing(fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"]),
+        "hist_conv_rates": lambda: q_historical_conversion_rates(fiscal["DAY_NUMBER"]),
+    }
+    all_phase1 = {**phase1_queries, **phase1_with_args}
+    p1_results = {}
+    p1_errors = {}
 
-    # Consumption & SI usage (need account IDs from prior queries)
-    _tick("Consumption & SI usage...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fn): name for name, fn in all_phase1.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                p1_results[name] = future.result()
+            except Exception as e:
+                p1_errors[name] = e
+                p1_results[name] = {} if name not in ("top5", "play_use_cases") else ([] if name == "top5" else {})
+
+    if p1_errors:
+        for name, err in p1_errors.items():
+            st.warning(f"Query '{name}' failed: {err}")
+
+    _tick("Phase 1 complete...")
+
+    # Unpack results
+    revenue = p1_results["revenue"]
+    forecasts = p1_results["forecasts"]
+    deployed = p1_results["deployed"]
+    last7 = p1_results["last7"]
+    pipeline = p1_results["pipeline"]
+    risk_analysis = p1_results["risk_analysis"]
+    top5 = p1_results["top5"]
+    play_summary = p1_results["play_summary"]
+    play_detail = p1_results["play_detail"]
+    bronze_tb_total = p1_results["bronze_tb_total"]
+    play_use_cases = p1_results["play_use_cases"]
+    play_risk = p1_results["play_risk"]
+    high_risk_ucs = p1_results["high_risk_ucs"]
+    play_targets = p1_results["play_targets"]
+    partner_sd = p1_results["partner_sd"]
+    pipeline_movements = p1_results["pipeline_movements"]
+    bronze_created = p1_results["bronze_created"]
+    si_created = p1_results["si_created"]
+    si_theater = p1_results["si_theater"]
+    bronze_tb_acct = p1_results["bronze_tb_acct"]
+    velocity = p1_results["velocity"]
+    pipeline_detail = p1_results["pipeline_detail"]
+    pipeline_phases = p1_results["pipeline_phases"]
+    cc_theater = p1_results["cc_theater"]
+    pacing = p1_results["pacing"]
+    hist_conv_rates = p1_results["hist_conv_rates"]
+
+    # --- Phase 2: Queries that depend on Phase 1 account IDs (parallel) ---
+    _tick("Account-level queries...")
     all_account_ids = set()
     for uc in top5:
         all_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
@@ -2285,18 +2346,32 @@ def _run_all_queries(gvp_name):
     for uc in play_use_cases.get("si", []):
         si_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
     si_account_ids.discard("")
-    consumption = q_consumption(all_account_ids)
-    si_usage = q_si_usage(si_account_ids)
 
-    # Cortex Code usage
-    _tick("Cortex Code usage...")
-    cc_theater = q_cortex_code_theater_usage()
-    cc_by_account = q_cortex_code_by_account(all_account_ids)
+    phase2_queries = {
+        "consumption": lambda: q_consumption(all_account_ids),
+        "si_usage": lambda: q_si_usage(si_account_ids),
+        "cc_by_account": lambda: q_cortex_code_by_account(all_account_ids),
+    }
+    p2_results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fn): name for name, fn in phase2_queries.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                p2_results[name] = future.result()
+            except Exception as e:
+                st.warning(f"Query '{name}' failed: {e}")
+                p2_results[name] = {}
 
+    consumption = p2_results["consumption"]
+    si_usage = p2_results["si_usage"]
+    cc_by_account = p2_results["cc_by_account"]
+
+    # --- Phase 3: Forecast computation (local, no SQL) ---
     _tick("Forecast models...")
     forecast_analysis = compute_forecast_analysis(
         pipeline_phases, hist_conv_rates, deployed, risk_analysis,
-        forecasts["most_likely"], pacing
+        forecasts.get("most_likely", 0) if isinstance(forecasts, dict) else 0, pacing
     )
     _tick("Backtest models...")
     backtest_results = q_backtest_models(hist_conv_rates)
@@ -2926,7 +3001,7 @@ st.set_page_config(
 # =============================================================================
 # ACCESS CONTROL — restrict to approved users
 # =============================================================================
-ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH"}
+ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH", "NTSUI"}
 
 def _check_access():
     """Verify the current user is in the approved access list."""
@@ -2934,6 +3009,7 @@ def _check_access():
         "nate.thomas@snowflake.com",
         "saskia.vandaal@snowflake.com",
         "matt.meredith@snowflake.com",
+        "nick.tsui@snowflake.com",
     }
     try:
         user_email = st.user.get("email", "").lower()
