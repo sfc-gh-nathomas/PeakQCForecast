@@ -75,6 +75,8 @@ CONFIG = {
     "bronze_campaign": "%Bronze Activation - Make Your Data AI Ready%",
     "sqlserver_campaign": "%SQL Server Migration - Modernize Your Data Estate%",
     "si_technical_use_case": "%AI: Snowflake Intelligence & Agents%",
+    "si_campaign_analyst": "%Cortex Analyst%",
+    "si_campaign_search": "%Cortex Search%",
     "excluded_stages": ("Not In Pursuit", "Use Case Lost"),
     "dim_excluded_stages": ("0 - Not In Pursuit", "8 - Use Case Lost"),
     "pursuit_stages": ("Discovery", "Scoping", "Technical / Business Validation"),
@@ -684,6 +686,7 @@ def q_bronze_tb_total():
         SELECT SUM(TB_INGESTED) as BRONZE_TB
         FROM SALES.REPORTING.SALES_PROGRAMS_BRONZE_INGEST
         WHERE GVP = '{CONFIG["gvp_name"]}'
+          AND MONTH BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
     """)
     return float(rows[0]["BRONZE_TB"] or 0)
 
@@ -955,11 +958,11 @@ def q_play_risk_detail():
 
 def q_play_targets():
     rows = run_query(f"""
-        SELECT PRIORITIZED_FEATURE_UC, TARGET_USE_CASE_EACV, TARGET_USE_CASE_COUNT
+        SELECT PRIORITIZED_FEATURE_UC, TARGET_USE_CASE_EACV, TARGET_USE_CASE_COUNT, MOVEMENT_TYPE
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
         WHERE MAPPED_THEATER = '{_theater()}'
           AND FISCAL_QUARTER = 'FY2027-Q1'
-          AND MOVEMENT_TYPE = 'Deployed'
+          AND MOVEMENT_TYPE IN ('Deployed', 'Created')
           AND PRIORITIZED_FEATURE_UC IN (
               'Make Your Data AI Ready', 'Modernize Your Data Estate',
               'AI: Snowflake Intelligence & Agents')
@@ -972,14 +975,18 @@ def q_play_targets():
     targets = {}
     for r in rows:
         key = mapping.get(r["PRIORITIZED_FEATURE_UC"])
+        movement = r["MOVEMENT_TYPE"].lower()  # 'deployed' or 'created'
         if key:
-            targets[key] = {
+            tgt = {
                 "acv": safe_float(r["TARGET_USE_CASE_EACV"]) if r["TARGET_USE_CASE_EACV"] else None,
                 "count": safe_int(r["TARGET_USE_CASE_COUNT"]) if r["TARGET_USE_CASE_COUNT"] else None,
             }
+            targets[f"{key}_{movement}"] = tgt
+    # Ensure all keys exist with defaults
     for k in ("bronze", "si", "sqlserver"):
-        if k not in targets:
-            targets[k] = {"acv": None, "count": None}
+        for m in ("deployed", "created"):
+            if f"{k}_{m}" not in targets:
+                targets[f"{k}_{m}"] = {"acv": None, "count": None}
     return targets
 
 
@@ -1152,6 +1159,20 @@ def q_bronze_created_qtd():
     """)
     target = safe_int(target_rows[0]["TARGET_USE_CASE_COUNT"]) if target_rows and target_rows[0]["TARGET_USE_CASE_COUNT"] else None
     return {"created": created, "target": target}
+
+
+def q_si_created_qtd():
+    """Count SI use cases created QTD using TECHNICAL_CAMPAIGN_S_C (same methodology as bronze)."""
+    created_rows = run_query(f"""
+        SELECT COUNT(*) as CREATED_COUNT
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND (u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["si_campaign_analyst"]}'
+               OR u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["si_campaign_search"]}')
+          AND u.CREATED_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+    """)
+    return safe_int(created_rows[0]["CREATED_COUNT"]) if created_rows else 0
 
 
 # =============================================================================
@@ -2234,6 +2255,8 @@ def _run_all_queries(gvp_name):
     pipeline_movements = q_pipeline_movements()
     _tick("Bronze created...")
     bronze_created = q_bronze_created_qtd()
+    _tick("SI created...")
+    si_created = q_si_created_qtd()
     _tick("SI theater totals...")
     si_theater = q_si_theater_totals()
     _tick("Bronze TB by account...")
@@ -2297,7 +2320,7 @@ def _run_all_queries(gvp_name):
         "si_usage": si_usage, "si_theater": si_theater, "pacing": pacing,
         "forecast_analysis": forecast_analysis, "play_targets": play_targets,
         "partner_sd": partner_sd, "uc_velocity": uc_velocity,
-        "bronze_created": bronze_created, "pipeline_movements": pipeline_movements,
+        "bronze_created": bronze_created, "si_created": si_created, "pipeline_movements": pipeline_movements,
         "cc_theater": cc_theater, "cc_by_account": cc_by_account,
         "_config": {
             "gvp_name": CONFIG.get("gvp_name"),
@@ -2555,8 +2578,8 @@ our projected quarter-end deployed ACV would be{f" <strong>{fmt_currency(day_pro
     if selected_play_key == "bronze":
         br_dep = _ps.get("bronze_deployed", _empty_ps)
         br_open = _ps.get("bronze_open", _empty_ps)
-        bronze_gap = fmt_play_gap(play_targets, "bronze", br_dep["acv"], br_dep["count"])
-        bronze_target = fmt_play_target(play_targets, "bronze")
+        bronze_gap = fmt_play_gap(play_targets, "bronze_deployed", br_dep["acv"], br_dep["count"])
+        bronze_target = fmt_play_target(play_targets, "bronze_deployed")
         bronze_risk = build_risk_narrative(play_risk["bronze"])
         br_created = bronze_created.get("created", 0)
         br_create_target = bronze_created.get("target")
@@ -2578,8 +2601,8 @@ Regional coverage: <strong>{play_detail["bronze"]["regions"]}</strong> of 8 {_th
     elif selected_play_key == "si":
         si_dep = _ps.get("si_deployed", _empty_ps)
         si_open = _ps.get("si_open", _empty_ps)
-        si_gap = fmt_play_gap(play_targets, "si", si_dep["acv"], si_dep["count"])
-        si_target_str = fmt_play_target(play_targets, "si")
+        si_gap = fmt_play_gap(play_targets, "si_deployed", si_dep["acv"], si_dep["count"])
+        si_target_str = fmt_play_target(play_targets, "si_deployed")
         si_risk = build_risk_narrative(play_risk["si"])
         script_html += f"""
 <h4 style="color: #555;">Snowflake Intelligence (AI: Snowflake Intelligence &amp; Agents)</h4>
@@ -2596,8 +2619,8 @@ Regional coverage: <strong>{play_detail["si"]["regions"]}</strong> of 8 {_theate
     elif selected_play_key == "sqlserver":
         sql_dep = _ps.get("sqlserver_deployed", _empty_ps)
         sql_open = _ps.get("sqlserver_open", _empty_ps)
-        sql_gap = fmt_play_gap(play_targets, "sqlserver", sql_dep["acv"], sql_dep["count"])
-        sqlserver_target = fmt_play_target(play_targets, "sqlserver")
+        sql_gap = fmt_play_gap(play_targets, "sqlserver_deployed", sql_dep["acv"], sql_dep["count"])
+        sqlserver_target = fmt_play_target(play_targets, "sqlserver_deployed")
         sql_risk = build_risk_narrative(play_risk["sqlserver"])
         script_html += f"""
 <h4 style="color: #555;">SQL Server Migration (Modernize Your Data Estate)</h4>
@@ -2688,12 +2711,64 @@ def render_golives_tab(data):
     day_pct = fmt_pct(pacing["day_pct"])
     week_avg = fmt_currency(pacing["week_avg"])
     week_pct = fmt_pct(pacing["week_pct"])
-    bronze_target = fmt_play_target(play_targets, "bronze")
-    si_target = fmt_play_target(play_targets, "si")
-    sqlserver_target = fmt_play_target(play_targets, "sqlserver")
-    bronze_gap = fmt_play_gap(play_targets, "bronze", play_summary["bronze_deployed"]["acv"], play_summary["bronze_deployed"]["count"])
-    si_gap = fmt_play_gap(play_targets, "si", play_summary["si_deployed"]["acv"], play_summary["si_deployed"]["count"])
-    sqlserver_gap = fmt_play_gap(play_targets, "sqlserver", play_summary["sqlserver_deployed"]["acv"], play_summary["sqlserver_deployed"]["count"])
+    bronze_created = data.get("bronze_created", {})
+    si_created = data.get("si_created", 0)
+    bronze_tb_total = data["bronze_tb_total"]
+
+    # --- Sales Play Performance table data ---
+    _ps = play_summary
+    _pt = play_targets
+    _empty_ps = {"acv": 0, "count": 0}
+
+    def _sp_attainment(actual, target):
+        if target is None or target == 0:
+            return "&mdash;"
+        pct = actual / target * 100
+        color = "#28a745" if pct >= 100 else "#dc3545"
+        return f'<span style="color:{color}; font-weight:600;">{pct:.0f}%</span>'
+
+    def _sp_coverage(actual, pipeline_val, target):
+        if target is None or target == 0:
+            return "&mdash;"
+        pct = (actual + pipeline_val) / target * 100
+        color = "#28a745" if pct >= 100 else "#dc3545"
+        return f'<span style="color:{color}; font-weight:600;">{pct:.0f}%</span>'
+
+    # Row 1: Bronze - Use Cases Created
+    br_created_actual = bronze_created.get("created", 0)
+    br_created_target = _pt.get("bronze_created", {}).get("count")
+    br_created_target_str = f"{br_created_target:,}" if br_created_target is not None else "&mdash;"
+    br_created_att = _sp_attainment(br_created_actual, br_created_target)
+
+    # Row 2: Bronze - DCT TBs Ingested
+    br_tb_actual = bronze_tb_total
+    br_tb_target = None  # Not available in Snowflake
+    br_tb_target_str = "&mdash;"
+    br_tb_att = "&mdash;"
+
+    # Row 3: SI - Use Cases Created
+    si_created_actual = si_created
+    si_created_target = _pt.get("si_created", {}).get("count")
+    si_created_target_str = f"{si_created_target:,}" if si_created_target is not None else "&mdash;"
+    si_created_att = _sp_attainment(si_created_actual, si_created_target)
+
+    # Row 4: SI - Use Cases Deployed
+    si_dep = _ps.get("si_deployed", _empty_ps)
+    si_open = _ps.get("si_open", _empty_ps)
+    si_dep_target = _pt.get("si_deployed", {}).get("count")
+    si_dep_target_str = f"{si_dep_target:,}" if si_dep_target is not None else "&mdash;"
+    si_dep_att = _sp_attainment(si_dep["count"], si_dep_target)
+    si_dep_pipeline = si_open["count"]
+    si_dep_coverage = _sp_coverage(si_dep["count"], si_dep_pipeline, si_dep_target)
+
+    # Row 5: SQL Server - Deployed EACV
+    sql_dep = _ps.get("sqlserver_deployed", _empty_ps)
+    sql_open = _ps.get("sqlserver_open", _empty_ps)
+    sql_dep_target = _pt.get("sqlserver_deployed", {}).get("acv")
+    sql_dep_target_str = fmt_currency(sql_dep_target) if sql_dep_target is not None else "&mdash;"
+    sql_dep_att = _sp_attainment(sql_dep["acv"], sql_dep_target)
+    sql_dep_pipeline = sql_open["acv"]
+    sql_dep_coverage = _sp_coverage(sql_dep["acv"], sql_dep_pipeline, sql_dep_target)
     fy_label = cfg.get("fiscal_year_label", "FY27")
     prior_fy_label = cfg.get("prior_fy_label", "FY26")
     cc_accounts = cc_theater.get("cc_accounts", 0)
@@ -2789,10 +2864,12 @@ def render_golives_tab(data):
 
 <h3>Sales Play Performance</h3>
 <table class="sales-play-table">
-  <tr><th>Sales Play</th><th>Open ACV</th><th>Open Count</th><th>Deployed ACV</th><th>Deployed Count</th><th>Deployed Target</th><th>Gap to Target</th></tr>
-  <tr><td><strong>Bronze Ingest</strong></td><td class="number open-acv">{fmt_currency(play_summary["bronze_open"]["acv"])}</td><td class="number">{play_summary["bronze_open"]["count"]}</td><td class="number deployed-acv">{fmt_currency(play_summary["bronze_deployed"]["acv"])}</td><td class="number">{play_summary["bronze_deployed"]["count"]}</td><td class="number">{bronze_target}</td><td class="number">{bronze_gap}</td></tr>
-  <tr><td><strong>Snowflake Intelligence</strong></td><td class="number open-acv">{fmt_currency(play_summary["si_open"]["acv"])}</td><td class="number">{play_summary["si_open"]["count"]}</td><td class="number deployed-acv">{fmt_currency(play_summary["si_deployed"]["acv"])}</td><td class="number">{play_summary["si_deployed"]["count"]}</td><td class="number">{si_target}</td><td class="number">{si_gap}</td></tr>
-  <tr><td><strong>SQL Server Migration</strong></td><td class="number open-acv">{fmt_currency(play_summary["sqlserver_open"]["acv"])}</td><td class="number">{play_summary["sqlserver_open"]["count"]}</td><td class="number deployed-acv">{fmt_currency(play_summary["sqlserver_deployed"]["acv"])}</td><td class="number">{play_summary["sqlserver_deployed"]["count"]}</td><td class="number">{sqlserver_target}</td><td class="number">{sqlserver_gap}</td></tr>
+  <tr><th>Sales Play</th><th>Metric</th><th>Q1 Target</th><th>QTD Actual</th><th>Attainment</th><th>Pipeline</th><th>Coverage</th></tr>
+  <tr><td><strong>Make Your Data AI Ready</strong></td><td>Use Cases Created</td><td class="number">{br_created_target_str}</td><td class="number">{br_created_actual:,}</td><td class="number">{br_created_att}</td><td class="number">&mdash;</td><td class="number">&mdash;</td></tr>
+  <tr><td><strong>Make Your Data AI Ready</strong></td><td>DCT TBs Ingested</td><td class="number">{br_tb_target_str}</td><td class="number">{br_tb_actual:,.1f} TB</td><td class="number">{br_tb_att}</td><td class="number">&mdash;</td><td class="number">&mdash;</td></tr>
+  <tr><td><strong>Snowflake Intelligence</strong></td><td>Use Cases Created</td><td class="number">{si_created_target_str}</td><td class="number">{si_created_actual:,}</td><td class="number">{si_created_att}</td><td class="number">&mdash;</td><td class="number">&mdash;</td></tr>
+  <tr><td><strong>Snowflake Intelligence</strong></td><td>Use Cases Deployed</td><td class="number">{si_dep_target_str}</td><td class="number">{si_dep["count"]:,}</td><td class="number">{si_dep_att}</td><td class="number">{si_dep_pipeline:,}</td><td class="number">{si_dep_coverage}</td></tr>
+  <tr><td><strong>SQL Server Migration</strong></td><td>Deployed EACV</td><td class="number">{sql_dep_target_str}</td><td class="number">{fmt_currency(sql_dep["acv"])}</td><td class="number">{sql_dep_att}</td><td class="number">{fmt_currency(sql_dep_pipeline)}</td><td class="number">{sql_dep_coverage}</td></tr>
 </table>
 
 <div class="play-section">
