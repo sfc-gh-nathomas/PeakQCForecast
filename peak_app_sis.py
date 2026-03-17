@@ -8,9 +8,11 @@ into a single standalone file compatible with Snowpark session execution.
 
 import os
 import re
+import time
 import html as html_lib
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
@@ -37,25 +39,44 @@ if _use_snowpark:
         pass  # May not be supported in all contexts
 
 
-def run_query(sql):
-    """Execute SQL and return results as list of dicts (compatible with all existing code)."""
-    if _use_snowpark:
-        df = session.sql(sql).to_pandas()
-    else:
-        cur = session.cursor()
-        cur.execute("USE WAREHOUSE SNOWADHOC")
-        cur.execute(sql)
-        cols = [desc[0] for desc in cur.description]
-        df = pd.DataFrame(cur.fetchall(), columns=cols)
-        cur.close()
-    # Convert DataFrame to list of dicts for compatibility
-    records = df.to_dict("records")
-    # Ensure numeric types are Python native (not numpy)
-    for row in records:
-        for k, v in row.items():
-            if hasattr(v, "item"):
-                row[k] = v.item()
-    return records
+def run_query(sql, _retries=2, _delay=3):
+    """Execute SQL and return results as list of dicts.
+    Retries on transient errors (e.g. view refresh, object not found)."""
+    last_err = None
+    for attempt in range(1 + _retries):
+        try:
+            if _use_snowpark:
+                df = session.sql(sql).to_pandas()
+            else:
+                cur = session.cursor()
+                cur.execute("USE WAREHOUSE SNOWADHOC")
+                cur.execute(sql)
+                cols = [desc[0] for desc in cur.description]
+                df = pd.DataFrame(cur.fetchall(), columns=cols)
+                cur.close()
+            # Convert DataFrame to list of dicts for compatibility
+            records = df.to_dict("records")
+            # Ensure numeric types are Python native (not numpy)
+            for row in records:
+                for k, v in row.items():
+                    if hasattr(v, "item"):
+                        row[k] = v.item()
+            return records
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            # Retry on transient object-not-found / auth errors (view being refreshed)
+            if attempt < _retries and ("does not exist or not authorized" in err_msg
+                                       or "Object does not exist" in err_msg):
+                time.sleep(_delay)
+                # Re-activate secondary roles in case session context was lost
+                if _use_snowpark:
+                    try:
+                        session.sql("USE SECONDARY ROLES ALL").collect()
+                    except Exception:
+                        pass
+                continue
+            raise last_err
 
 
 # =============================================================================
@@ -77,6 +98,12 @@ CONFIG = {
     "si_technical_use_case": "%AI: Snowflake Intelligence & Agents%",
     "si_campaign_analyst": "%Cortex Analyst%",
     "si_campaign_search": "%Cortex Search%",
+    "dim_uc_direct_table": "MDM.MDM_INTERFACES.DIM_USE_CASE",
+    "tb_ingest_table": "SALES.SALES_BI.SALES_PROGRAMS_BRONZE_INGEST",
+    "tb_goals_table": "SALES.SALES_BI.SALES_PROGRAMS_SUCCESS_GOALS",
+    "bronze_feature": "%Make Your Data AI Ready%",
+    "sqlserver_feature": "%Modernize Your Data Estate%",
+    "si_technical_uc": "%Snowflake Intelligence%",
     "excluded_stages": ("Not In Pursuit", "Use Case Lost"),
     "dim_excluded_stages": ("0 - Not In Pursuit", "8 - Use Case Lost"),
     "pursuit_stages": ("Discovery", "Scoping", "Technical / Business Validation"),
@@ -86,7 +113,6 @@ CONFIG = {
     "raven_uc_table": "SALES.RAVEN.USE_CASE_EXPLORER_VH_DELIVERABLE_C",
     "raven_acct_table": "SALES.RAVEN.D_SALESFORCE_ACCOUNT_CUSTOMERS",
     "dim_uc_table": "(SELECT * FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS WHERE DS = (SELECT MAX(DS) FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS))",
-    "vivun_table": "SALES.SE_REPORTING.VIVUN_DELIVERABLES_DAILY_DS",
 }
 
 RISK_CATEGORIES = [
@@ -108,6 +134,70 @@ GVP_THEATER_MAP = {
 def _theater():
     """Return the theater name for the current GVP."""
     return GVP_THEATER_MAP.get(CONFIG["gvp_name"], CONFIG["gvp_name"])
+
+
+# Snowflake fiscal year starts Feb 1.
+# Q1=Feb-Apr, Q2=May-Jul, Q3=Aug-Oct, Q4=Nov-Jan
+FISCAL_QUARTER_DEFS = [
+    ("Q1", 2, 1, 4, 30),   # (label, start_month, start_day, end_month, end_day)
+    ("Q2", 5, 1, 7, 31),
+    ("Q3", 8, 1, 10, 31),
+    ("Q4", 11, 1, 1, 31),  # end is Jan 31 of next calendar year
+]
+
+
+def _build_quarter_options():
+    """Build a list of selectable fiscal quarters from FY26-Q1 through next FY's Q4.
+
+    Returns list of dicts: {"label": "FY26-Q1", "fy": 2026, "q_idx": 0,
+                            "start": "2025-02-01", "end": "2025-04-30"}
+    """
+    from datetime import date
+    today = date.today()
+    # Determine current FY
+    if today.month >= 2:
+        current_fy = today.year + 1
+    else:
+        current_fy = today.year
+
+    options = []
+    for fy in range(2026, current_fy + 2):  # FY26 through current+1
+        cal_year = fy - 1  # calendar year when FY starts (Feb)
+        for q_idx, (q_label, sm, sd, em, ed) in enumerate(FISCAL_QUARTER_DEFS):
+            if q_label == "Q4":
+                start = f"{cal_year}-{sm:02d}-{sd:02d}"
+                end = f"{cal_year + 1}-{em:02d}-{ed:02d}"
+            else:
+                start = f"{cal_year}-{sm:02d}-{sd:02d}"
+                end = f"{cal_year}-{em:02d}-{ed:02d}"
+            options.append({
+                "label": f"FY{fy % 100}-{q_label}",
+                "fy": fy,
+                "q_idx": q_idx,
+                "start": start,
+                "end": end,
+            })
+    return options
+
+
+def _current_quarter_label():
+    """Return the label for today's fiscal quarter, e.g. 'FY27-Q1'."""
+    from datetime import date
+    today = date.today()
+    if today.month >= 2:
+        fy = today.year + 1
+    else:
+        fy = today.year
+    month = today.month
+    if month in (2, 3, 4):
+        q = "Q1"
+    elif month in (5, 6, 7):
+        q = "Q2"
+    elif month in (8, 9, 10):
+        q = "Q3"
+    else:
+        q = "Q4"
+    return f"FY{fy % 100}-{q}"
 
 
 # =============================================================================
@@ -220,14 +310,12 @@ def extract_latest_comment(text):
 
 
 def update_risk_thresholds_from_velocity(velocity):
-    tw = velocity["current"].get("time_to_tw")
-    imp = velocity["current"].get("won_to_imp_start")
-    dep = velocity["current"].get("won_to_deployed")
-    # Fall back to prior quarter, then CONFIG defaults
-    prior = velocity.get("prior", {})
-    tw = int(round(tw)) if tw is not None and not _is_nan(tw) else (int(round(prior.get("time_to_tw"))) if prior.get("time_to_tw") is not None and not _is_nan(prior.get("time_to_tw")) else CONFIG["days_to_tw"])
-    imp = int(round(imp)) if imp is not None and not _is_nan(imp) else (int(round(prior.get("won_to_imp_start"))) if prior.get("won_to_imp_start") is not None and not _is_nan(prior.get("won_to_imp_start")) else CONFIG["days_to_imp"])
-    dep = int(round(dep)) if dep is not None and not _is_nan(dep) else (int(round(prior.get("won_to_deployed"))) if prior.get("won_to_deployed") is not None and not _is_nan(prior.get("won_to_deployed")) else CONFIG["days_to_deploy"])
+    tw = velocity.get("time_to_tw")
+    imp = velocity.get("tw_to_imp_start")
+    dep = velocity.get("imp_to_deployed")
+    tw = int(round(tw)) if tw is not None and not _is_nan(tw) else CONFIG["days_to_tw"]
+    imp = int(round(imp)) if imp is not None and not _is_nan(imp) else CONFIG["days_to_imp"]
+    dep = int(round(dep)) if dep is not None and not _is_nan(dep) else CONFIG["days_to_deploy"]
     CONFIG["days_to_tw"] = tw
     CONFIG["days_to_imp"] = imp
     CONFIG["days_to_deploy"] = dep
@@ -242,63 +330,110 @@ def update_risk_thresholds_from_velocity(velocity):
 # SQL QUERIES
 # =============================================================================
 
-def q_fiscal_calendar():
-    # Snowflake fiscal year starts Feb 1. Compute inline to avoid dependency on CORE_FISCAL_DATES.
-    rows = run_query("""
-        SELECT
-            CASE
-                WHEN MONTH(CURRENT_DATE()) >= 2 THEN YEAR(CURRENT_DATE()) + 1
-                ELSE YEAR(CURRENT_DATE())
-            END AS FISCAL_YEAR,
-            CASE
-                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN 'Q1'
-                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN 'Q2'
-                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN 'Q3'
-                ELSE 'Q4'
-            END AS FISCAL_QUARTER,
-            CASE
-                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 2, 1)
-                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 5, 1)
-                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 8, 1)
-                WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 11, 1)
-                ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()) - 1, 11, 1)
-            END AS FQ_START,
-            CASE
-                WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 4, 30)
-                WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 7, 31)
-                WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 10, 31)
-                WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()) + 1, 1, 31)
-                ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 1, 31)
-            END AS FQ_END
-    """)
-    assert len(rows) == 1, f"Expected 1 fiscal calendar row, got {len(rows)}"
-    fiscal = rows[0]
-    fy = safe_int(fiscal["FISCAL_YEAR"])
-    fq_start = safe_str(fiscal["FQ_START"]).strip('"')
-    fq_end = safe_str(fiscal["FQ_END"]).strip('"')
+def q_fiscal_calendar(quarter_override=None):
+    """Compute fiscal calendar. If quarter_override is provided, use its dates instead of CURRENT_DATE().
+
+    quarter_override: dict with keys "label", "fy", "start", "end" from _build_quarter_options(),
+                      or None to auto-detect from CURRENT_DATE().
+    """
+    from datetime import date
+
+    current_q_label = _current_quarter_label()
+
+    if quarter_override is not None:
+        # Use the override dates directly — no SQL needed for fiscal period
+        fy = quarter_override["fy"]
+        fq_label = quarter_override["label"].split("-")[1]  # e.g. "Q1" from "FY27-Q1"
+        fq_start = quarter_override["start"]
+        fq_end = quarter_override["end"]
+        is_current = (quarter_override["label"] == current_q_label)
+        fiscal = {
+            "FISCAL_YEAR": fy,
+            "FISCAL_QUARTER": fq_label,
+            "FQ_START": fq_start,
+            "FQ_END": fq_end,
+        }
+    else:
+        # Original behavior: detect from CURRENT_DATE()
+        rows = run_query("""
+            SELECT
+                CASE
+                    WHEN MONTH(CURRENT_DATE()) >= 2 THEN YEAR(CURRENT_DATE()) + 1
+                    ELSE YEAR(CURRENT_DATE())
+                END AS FISCAL_YEAR,
+                CASE
+                    WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN 'Q1'
+                    WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN 'Q2'
+                    WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN 'Q3'
+                    ELSE 'Q4'
+                END AS FISCAL_QUARTER,
+                CASE
+                    WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 2, 1)
+                    WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 5, 1)
+                    WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 8, 1)
+                    WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 11, 1)
+                    ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()) - 1, 11, 1)
+                END AS FQ_START,
+                CASE
+                    WHEN MONTH(CURRENT_DATE()) IN (2,3,4) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 4, 30)
+                    WHEN MONTH(CURRENT_DATE()) IN (5,6,7) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 7, 31)
+                    WHEN MONTH(CURRENT_DATE()) IN (8,9,10) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 10, 31)
+                    WHEN MONTH(CURRENT_DATE()) IN (11,12) THEN DATE_FROM_PARTS(YEAR(CURRENT_DATE()) + 1, 1, 31)
+                    ELSE DATE_FROM_PARTS(YEAR(CURRENT_DATE()), 1, 31)
+                END AS FQ_END
+        """)
+        assert len(rows) == 1, f"Expected 1 fiscal calendar row, got {len(rows)}"
+        fiscal = rows[0]
+        fy = safe_int(fiscal["FISCAL_YEAR"])
+        fq_start = safe_str(fiscal["FQ_START"]).strip('"')
+        fq_end = safe_str(fiscal["FQ_END"]).strip('"')
+        fq_label = safe_str(fiscal.get("FISCAL_QUARTER", "Q1"))
+        is_current = True
+
     CONFIG["quarter_start"] = fq_start
     CONFIG["quarter_end"] = fq_end
     CONFIG["fiscal_year"] = fy
     CONFIG["fiscal_year_label"] = f"FY{fy % 100}"
     CONFIG["prior_fy_label"] = f"FY{(fy - 1) % 100}"
+    CONFIG["fiscal_quarter"] = f"FY{fy}-{fq_label}"
+    CONFIG["is_current_quarter"] = is_current
 
-    # Compute day/week number
-    day_number = None
-    week_number = None
-    day_rows = run_query(f"""
-        SELECT DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1 AS DAY_NUMBER,
-               CEIL((DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1) / 7.0) AS WEEK_NUMBER
-    """)
-    if day_rows:
-        day_number = safe_int(day_rows[0].get("DAY_NUMBER", 0))
-        week_number = safe_int(day_rows[0].get("WEEK_NUMBER", 0))
+    # Compute day/week number and reference_date
+    if is_current:
+        # Current quarter: use CURRENT_DATE() as reference
+        day_rows = run_query(f"""
+            SELECT DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1 AS DAY_NUMBER,
+                   CEIL((DATEDIFF('day', '{fq_start}'::DATE, CURRENT_DATE()) + 1) / 7.0) AS WEEK_NUMBER
+        """)
+        day_number = safe_int(day_rows[0].get("DAY_NUMBER", 0)) if day_rows else 0
+        week_number = safe_int(day_rows[0].get("WEEK_NUMBER", 0)) if day_rows else 0
+        dr_rows = run_query(f"SELECT DATEDIFF('day', CURRENT_DATE(), '{fq_end}'::DATE) + 1 AS DAYS_REMAINING")
+        days_remaining = safe_int(dr_rows[0].get("DAYS_REMAINING", 0)) if dr_rows else 0
+        CONFIG["reference_date"] = "CURRENT_DATE()"
+    else:
+        # Non-current quarter: determine if past or future
+        today = date.today()
+        fq_end_date = date.fromisoformat(fq_end)
+        fq_start_date = date.fromisoformat(fq_start)
+        if today > fq_end_date:
+            # Past quarter — fully elapsed
+            total_days = (fq_end_date - fq_start_date).days + 1
+            day_number = total_days
+            week_number = -(-total_days // 7)  # ceil division
+            days_remaining = 0
+            CONFIG["reference_date"] = f"'{fq_end}'::DATE"
+        else:
+            # Future quarter — not yet started
+            day_number = 0
+            week_number = 0
+            total_days = (fq_end_date - fq_start_date).days + 1
+            days_remaining = total_days
+            CONFIG["reference_date"] = f"'{fq_start}'::DATE"
+
     fiscal["DAY_NUMBER"] = day_number
     fiscal["WEEK_NUMBER"] = week_number
-    fiscal["DAYS_REMAINING"] = None
-    dr_rows = run_query(f"SELECT DATEDIFF('day', CURRENT_DATE(), '{fq_end}'::DATE) + 1 AS DAYS_REMAINING")
-    if dr_rows:
-        fiscal["DAYS_REMAINING"] = safe_int(dr_rows[0].get("DAYS_REMAINING", 0))
-        CONFIG["days_remaining"] = fiscal["DAYS_REMAINING"]
+    fiscal["DAYS_REMAINING"] = days_remaining
+    CONFIG["days_remaining"] = days_remaining
 
     # Prior FY quarters: FY starts Feb 1, so prior FY = fy-1
     prior_fy_start_year = fy - 2  # calendar year when prior FY starts (Feb)
@@ -417,67 +552,39 @@ def q_last7_deployed():
         WHERE a.GVP = '{CONFIG["gvp_name"]}'
           AND u.USE_CASE_ACV > 0
           AND u.IS_WENT_LIVE = TRUE
-          AND u.DEFAULT_DATE >= DATEADD('day', -7, CURRENT_DATE())
+          AND u.DEFAULT_DATE >= DATEADD('day', -7, {CONFIG["reference_date"]})
     """)
     r = rows[0]
     return {"acv": safe_float(r["LAST7_ACV"] or 0), "count": safe_int(r["LAST7_COUNT"] or 0)}
 
 
 def q_deployment_velocity():
-    snapshot_table = "SALES.REPORTING.DIM_USE_CASE_HISTORY_DS"
-    quarters = CONFIG["prior_fy_quarters"]
-    cur = run_query(f"""
-        SELECT
-            SUM(CASE WHEN u.DEFAULT_DATE >= DATEADD('day', -7, CURRENT_DATE()) THEN u.USE_CASE_ACV ELSE 0 END) as V7,
-            SUM(CASE WHEN u.DEFAULT_DATE >= DATEADD('day', -14, CURRENT_DATE()) THEN u.USE_CASE_ACV ELSE 0 END) as V14,
-            SUM(CASE WHEN u.DEFAULT_DATE >= DATEADD('day', -30, CURRENT_DATE()) THEN u.USE_CASE_ACV ELSE 0 END) as V30
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0
-          AND u.IS_WENT_LIVE = TRUE
-          AND u.DEFAULT_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+    # Velocity cache is a point-in-time snapshot — only meaningful for current quarter
+    if not CONFIG.get("is_current_quarter", True):
+        return {"current": {"v7": 0, "v14": 0, "v30": 0}, "historical": []}
+    gvp = CONFIG["gvp_name"]
+    rows = run_query(f"""
+        SELECT PERIOD, V7, V14, V30
+        FROM SNOWPUBLIC.STREAMLIT.VELOCITY_CACHE
+        WHERE ACCOUNT_GVP = '{gvp}' AND METRIC_TYPE = 'deployment'
+        ORDER BY PERIOD
     """)
-    current = cur[0] if cur else {}
-    day_num = int(CONFIG.get("day_number", 31))
+    current = {"v7": 0, "v14": 0, "v30": 0}
     hist_velocities = []
-    for i, (qs, qe) in enumerate(quarters):
-        q_label = f"{CONFIG['prior_fy_label']} Q{i+1}"
-        snap_date = f"DATEADD('day', {day_num - 1}, '{qs}')::DATE"
-        snap7 = f"DATEADD('day', {day_num - 8}, '{qs}')::DATE"
-        snap14 = f"DATEADD('day', {day_num - 15}, '{qs}')::DATE"
-        snap30 = f"DATEADD('day', {day_num - 31}, '{qs}')::DATE"
-        hist_rows = run_query(f"""
-            SELECT
-                '{q_label}' as QTR,
-                SUM(CASE WHEN h.ACTUAL_USE_CASE_DEPLOYMENT_DATE > {snap7}
-                         AND h.ACTUAL_USE_CASE_DEPLOYMENT_DATE <= {snap_date}
-                         AND h.IS_DEPLOYED = TRUE
-                    THEN h.USE_CASE_EACV ELSE 0 END) as V7,
-                SUM(CASE WHEN h.ACTUAL_USE_CASE_DEPLOYMENT_DATE > {snap14}
-                         AND h.ACTUAL_USE_CASE_DEPLOYMENT_DATE <= {snap_date}
-                         AND h.IS_DEPLOYED = TRUE
-                    THEN h.USE_CASE_EACV ELSE 0 END) as V14,
-                SUM(CASE WHEN h.ACTUAL_USE_CASE_DEPLOYMENT_DATE > {snap30}
-                         AND h.ACTUAL_USE_CASE_DEPLOYMENT_DATE <= {snap_date}
-                         AND h.IS_DEPLOYED = TRUE
-                    THEN h.USE_CASE_EACV ELSE 0 END) as V30
-            FROM {snapshot_table} h
-            WHERE h.DS = {snap_date}
-              AND h.THEATER_NAME = '{_theater()}'
-              AND h.USE_CASE_EACV > 0
-        """)
-        if hist_rows and (float(hist_rows[0].get("V7", 0) or 0) > 0 or float(hist_rows[0].get("V30", 0) or 0) > 0):
-            hist_rows[0]["QTR"] = q_label
-            hist_velocities.append(hist_rows[0])
-    return {
-        "current": {
-            "v7": float(current.get("V7", 0) or 0),
-            "v14": float(current.get("V14", 0) or 0),
-            "v30": float(current.get("V30", 0) or 0),
-        },
-        "historical": hist_velocities,
-    }
+    period_labels = {"hist_q1": f"{CONFIG['prior_fy_label']} Q1",
+                     "hist_q2": f"{CONFIG['prior_fy_label']} Q2",
+                     "hist_q3": f"{CONFIG['prior_fy_label']} Q3",
+                     "hist_q4": f"{CONFIG['prior_fy_label']} Q4"}
+    for r in rows:
+        period = r.get("PERIOD", "")
+        v7 = float(r.get("V7", 0) or 0)
+        v14 = float(r.get("V14", 0) or 0)
+        v30 = float(r.get("V30", 0) or 0)
+        if period == "current":
+            current = {"v7": v7, "v14": v14, "v30": v30}
+        elif period in period_labels and (v7 > 0 or v30 > 0):
+            hist_velocities.append({"QTR": period_labels[period], "V7": v7, "V14": v14, "V30": v30})
+    return {"current": current, "historical": hist_velocities}
 
 
 def q_risk_adjusted_pipeline_detail():
@@ -486,7 +593,7 @@ def q_risk_adjusted_pipeline_detail():
         WITH fiscal_qtr AS (
             SELECT '{CONFIG["quarter_start"]}'::DATE AS FQ_START,
                    '{CONFIG["quarter_end"]}'::DATE AS FQ_END,
-                   DATEDIFF('day', CURRENT_DATE(), '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
+                   DATEDIFF('day', {CONFIG["reference_date"]}, '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
         )
         SELECT u.USE_CASE_ID, u.USE_CASE_NAME, u.ACCOUNT_NAME, r.USE_CASE_ACV as USE_CASE_EACV,
                u.STAGE_NUMBER, r.USE_CASE_STAGE, u.DAYS_IN_STAGE, r.GO_LIVE_DATE,
@@ -532,7 +639,7 @@ def q_pipeline_risk():
         WITH fiscal_qtr AS (
             SELECT '{CONFIG["quarter_start"]}'::DATE AS FQ_START,
                    '{CONFIG["quarter_end"]}'::DATE AS FQ_END,
-                   DATEDIFF('day', CURRENT_DATE(), '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
+                   DATEDIFF('day', {CONFIG["reference_date"]}, '{CONFIG["quarter_end"]}'::DATE) + 1 AS DAYS_REMAINING
         )
         SELECT
             CASE
@@ -599,6 +706,29 @@ def _use_case_select_cols():
     """
 
 
+def _dim_use_case_select_cols():
+    return """
+        u.USE_CASE_ID,
+        u.ACCOUNT_ID,
+        u.USE_CASE_NUMBER,
+        u.ACCOUNT_NAME,
+        u.USE_CASE_NAME,
+        u.USE_CASE_EACV,
+        u.GO_LIVE_FORECAST_STATUS as FORECAST_CATEGORY,
+        u.GO_LIVE_DATE,
+        u.USE_CASE_STAGE,
+        u.SE_COMMENTS,
+        u.NEXT_STEPS,
+        u.USE_CASE_RISK,
+        u.ACCOUNT_OWNER_NAME as ACCOUNT_EXECUTIVE_NAME,
+        u.USE_CASE_LEAD_SE_NAME,
+        u.REGION_NAME,
+        u.USE_CASE_DESCRIPTION,
+        u.IMPLEMENTER,
+        u.PARTNER_NAME
+    """
+
+
 def q_top5_use_cases():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
     return run_query(f"""
@@ -613,61 +743,48 @@ def q_top5_use_cases():
     """)
 
 
-def _play_summary_query(play_name, extra_join, filter_clause, is_deployed):
-    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+def _play_summary_query(play_name, filter_clause, is_deployed):
     if is_deployed:
-        deploy_filter = "u.IS_WENT_LIVE = TRUE"
-        date_filter = f"u.DEFAULT_DATE BETWEEN '{CONFIG['quarter_start']}' AND '{CONFIG['quarter_end']}'"
-        stage_filter = ""
+        deploy_filter = f"u.GO_LIVE_DATE BETWEEN '{CONFIG['quarter_start']}' AND '{CONFIG['quarter_end']}'"
     else:
-        deploy_filter = "u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE"
-        date_filter = f"u.GO_LIVE_DATE BETWEEN '{CONFIG['quarter_start']}' AND '{CONFIG['quarter_end']}'"
-        stage_filter = f"AND u.USE_CASE_STAGE NOT IN ({excluded})"
+        deploy_filter = f"u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')"
     rows = run_query(f"""
-        SELECT SUM(u.USE_CASE_ACV) as ACV, COUNT(*) as COUNT_
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND {deploy_filter} AND {date_filter}
-          {stage_filter} AND {filter_clause}
+        SELECT COALESCE(SUM(u.USE_CASE_EACV), 0) as ACV, COUNT(*) as COUNT_
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.USE_CASE_EACV > 0 AND {deploy_filter}
+          AND {filter_clause}
     """)
     r = rows[0]
     return {"acv": safe_float(r["ACV"] or 0), "count": safe_int(r["COUNT_"] or 0)}
 
 
 def q_sales_play_summary():
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
-    bronze_filter = f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"
-    sql_filter = f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"
-    si_filter = f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"
+    bronze_filter = f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['bronze_feature']}'"
+    sql_filter = f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['sqlserver_feature']}'"
+    si_filter = f"u.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_uc']}'"
     result = {}
-    for play, extra_join, filt in [
-        ("bronze", "", bronze_filter),
-        ("si", dim_join, si_filter),
-        ("sqlserver", "", sql_filter),
+    for play, filt in [
+        ("bronze", bronze_filter),
+        ("si", si_filter),
+        ("sqlserver", sql_filter),
     ]:
-        result[f"{play}_open"] = _play_summary_query(play, extra_join, filt, False)
-        result[f"{play}_deployed"] = _play_summary_query(play, extra_join, filt, True)
+        result[f"{play}_open"] = _play_summary_query(play, filt, False)
+        result[f"{play}_deployed"] = _play_summary_query(play, filt, True)
     return result
 
 
 def q_play_detail_metrics():
-    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
-
-    def _run(extra_join, filter_clause):
+    def _run(filter_clause):
         rows = run_query(f"""
-            SELECT COUNT(*) as OPEN_COUNT, AVG(u.USE_CASE_ACV) as AVG_ACV,
-                   MEDIAN(u.USE_CASE_ACV) as MEDIAN_ACV,
-                   COUNT(DISTINCT a.SALES_AREA) as REGION_COUNT
-            FROM {CONFIG["raven_uc_table"]} u
-            JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-            {extra_join}
-            WHERE a.GVP = '{CONFIG["gvp_name"]}'
-              AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-              AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-              AND u.USE_CASE_STAGE NOT IN ({excluded}) AND {filter_clause}
+            SELECT COUNT(*) as OPEN_COUNT, AVG(u.USE_CASE_EACV) as AVG_ACV,
+                   MEDIAN(u.USE_CASE_EACV) as MEDIAN_ACV,
+                   COUNT(DISTINCT u.REGION_NAME) as REGION_COUNT
+            FROM {CONFIG["dim_uc_direct_table"]} u
+            WHERE u.THEATER_NAME = '{_theater()}'
+              AND u.USE_CASE_EACV > 0
+              AND u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')
+              AND {filter_clause}
         """)
         r = rows[0]
         return {
@@ -675,44 +792,53 @@ def q_play_detail_metrics():
             "median_acv": safe_float(r["MEDIAN_ACV"] or 0), "regions": safe_int(r["REGION_COUNT"] or 0),
         }
     return {
-        "bronze": _run("", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"),
-        "si": _run(dim_join, f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"),
-        "sqlserver": _run("", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"),
+        "bronze": _run(f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['bronze_feature']}'"),
+        "si": _run(f"u.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_uc']}'"),
+        "sqlserver": _run(f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['sqlserver_feature']}'"),
     }
 
 
 def q_bronze_tb_total():
     rows = run_query(f"""
-        SELECT SUM(TB_INGESTED) as BRONZE_TB
-        FROM SALES.REPORTING.SALES_PROGRAMS_BRONZE_INGEST
-        WHERE GVP = '{CONFIG["gvp_name"]}'
+        SELECT COALESCE(SUM(TB_INGESTED), 0) as BRONZE_TB
+        FROM {CONFIG["tb_ingest_table"]}
+        WHERE GEO_NAME = '{_theater()}'
+          AND IS_BRONZE = true
           AND MONTH BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
     """)
     return float(rows[0]["BRONZE_TB"] or 0)
 
 
-def _play_use_cases_query(play_name, extra_join, filter_clause):
-    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+def q_bronze_tb_target():
+    """Fetch TB Ingested target from SALES_PROGRAMS_SUCCESS_GOALS for current theater/quarter."""
+    rows = run_query(f"""
+        SELECT GOAL
+        FROM {CONFIG["tb_goals_table"]}
+        WHERE THEATER = '{_theater()}'
+          AND GOAL_TYPE = 'TB Ingested'
+          AND TAG_VALUE = 'Make Your Data AI Ready'
+          AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
+    """)
+    return float(rows[0]["GOAL"]) if rows and rows[0]["GOAL"] else None
+
+
+def _play_use_cases_query(play_name, filter_clause):
     return run_query(f"""
-        SELECT {_use_case_select_cols()}
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV >= {CONFIG["play_threshold"]}
-          AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded}) AND {filter_clause}
-        ORDER BY u.USE_CASE_ACV DESC
+        SELECT {_dim_use_case_select_cols()}
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.USE_CASE_EACV >= {CONFIG["play_threshold"]}
+          AND u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')
+          AND {filter_clause}
+        ORDER BY u.USE_CASE_EACV DESC
     """)
 
 
 def q_play_use_cases():
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
     return {
-        "bronze": _play_use_cases_query("Bronze", "", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"),
-        "si": _play_use_cases_query("SI", dim_join, f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"),
-        "sqlserver": _play_use_cases_query("SQL Server", "", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"),
+        "bronze": _play_use_cases_query("Bronze", f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['bronze_feature']}'"),
+        "si": _play_use_cases_query("SI", f"u.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_uc']}'"),
+        "sqlserver": _play_use_cases_query("SQL Server", f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['sqlserver_feature']}'"),
     }
 
 
@@ -885,74 +1011,65 @@ def q_bronze_tb_by_account():
     rows = run_query(f"""
         SELECT SALESFORCE_ACCOUNT_ID as ACCOUNT_ID, SALESFORCE_ACCOUNT_NAME as ACCOUNT_NAME,
                ROUND(SUM(TB_INGESTED), 1) as TB_INGESTED
-        FROM SALES.REPORTING.SALES_PROGRAMS_BRONZE_INGEST
-        WHERE GVP = '{CONFIG["gvp_name"]}'
+        FROM {CONFIG["tb_ingest_table"]}
+        WHERE GEO_NAME = '{_theater()}'
+          AND IS_BRONZE = true
         GROUP BY SALESFORCE_ACCOUNT_ID, SALESFORCE_ACCOUNT_NAME
     """)
     return {r["ACCOUNT_ID"]: r for r in rows}
 
 
-def _play_risk_detail_query(play_name, extra_join, filter_clause):
-    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
+def _play_risk_detail_query(play_name, filter_clause):
     risk_rows = run_query(f"""
-        SELECT a.SALESFORCE_ACCOUNT_NAME as ACCOUNT_NAME, u.VH_NAME_C as USE_CASE_NAME,
-               u.USE_CASE_ACV as USE_CASE_EACV, u.USE_CASE_RISK_C as USE_CASE_RISK,
-               u.USE_CASE_COMMENTS_C as SE_COMMENTS, u.NEXT_STEP_C as NEXT_STEPS, u.USE_CASE_STAGE
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded})
-          AND u.USE_CASE_RISK_C IS NOT NULL AND u.USE_CASE_RISK_C != '' AND u.USE_CASE_RISK_C != 'None'
+        SELECT u.ACCOUNT_NAME, u.USE_CASE_NAME,
+               u.USE_CASE_EACV, u.USE_CASE_RISK,
+               u.SE_COMMENTS, u.NEXT_STEPS, u.USE_CASE_STAGE
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.USE_CASE_EACV > 0
+          AND u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')
+          AND u.USE_CASE_RISK IS NOT NULL AND u.USE_CASE_RISK != '' AND u.USE_CASE_RISK != 'None'
           AND {filter_clause}
-        ORDER BY u.USE_CASE_ACV DESC
+        ORDER BY u.USE_CASE_EACV DESC
     """)
     total_rows = run_query(f"""
         SELECT COUNT(*) as TOTAL_COUNT
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded}) AND {filter_clause}
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.USE_CASE_EACV > 0
+          AND u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')
+          AND {filter_clause}
     """)
     total = safe_int(total_rows[0]["TOTAL_COUNT"])
     return {"risk_rows": risk_rows, "total_count": total}
 
 
 def q_high_risk_use_cases():
-    excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
     return run_query(f"""
-        SELECT u.ID as USE_CASE_ID, u.NAME as USE_CASE_NUMBER, u.VH_NAME_C as USE_CASE_NAME,
-               a.SALESFORCE_OWNER_NAME as AE_NAME, a.LEAD_SALES_ENGINEER_NAME as SE_NAME,
-               u.USE_CASE_ACV, u.USE_CASE_RISK_C as RISK_TYPE,
+        SELECT u.USE_CASE_ID, u.USE_CASE_NUMBER, u.USE_CASE_NAME,
+               u.ACCOUNT_OWNER_NAME as AE_NAME, u.USE_CASE_LEAD_SE_NAME as SE_NAME,
+               u.USE_CASE_EACV as USE_CASE_ACV, u.USE_CASE_RISK as RISK_TYPE,
                SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b',
                    CONCAT('Summarize this use case risk in 1-2 concise sentences for a sales leadership QC call. Focus on what the risk is and the current mitigation plan. Do not include any preamble or introductory text, just provide the summary directly. Risk type: ',
-                       COALESCE(u.USE_CASE_RISK_C, 'Unknown'),
-                       '. SE Comments: ', COALESCE(u.USE_CASE_COMMENTS_C, 'None'),
-                       '. Next Steps: ', COALESCE(u.NEXT_STEP_C, 'None'))
+                       COALESCE(u.USE_CASE_RISK, 'Unknown'),
+                       '. SE Comments: ', COALESCE(u.SE_COMMENTS, 'None'),
+                       '. Next Steps: ', COALESCE(u.NEXT_STEPS, 'None'))
                ) as RISK_SUMMARY
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded})
-          AND u.USE_CASE_RISK_C IS NOT NULL AND u.USE_CASE_RISK_C != '' AND u.USE_CASE_RISK_C != 'None'
-          AND u.USE_CASE_ACV >= {CONFIG["play_threshold"]}
-        ORDER BY u.USE_CASE_ACV DESC
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.USE_CASE_EACV > 0
+          AND u.USE_CASE_STATUS IN ('In Pursuit', 'Implementation')
+          AND u.USE_CASE_RISK IS NOT NULL AND u.USE_CASE_RISK != '' AND u.USE_CASE_RISK != 'None'
+          AND u.USE_CASE_EACV >= {CONFIG["play_threshold"]}
+        ORDER BY u.USE_CASE_EACV DESC
     """)
 
 
 def q_play_risk_detail():
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
     return {
-        "bronze": _play_risk_detail_query("Bronze", "", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"),
-        "si": _play_risk_detail_query("SI", dim_join, f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"),
-        "sqlserver": _play_risk_detail_query("SQL Server", "", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"),
+        "bronze": _play_risk_detail_query("Bronze", f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['bronze_feature']}'"),
+        "si": _play_risk_detail_query("SI", f"u.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_uc']}'"),
+        "sqlserver": _play_risk_detail_query("SQL Server", f"u.PRIORITIZED_FEATURES ILIKE '{CONFIG['sqlserver_feature']}'"),
     }
 
 
@@ -961,8 +1078,8 @@ def q_play_targets():
         SELECT PRIORITIZED_FEATURE_UC, TARGET_USE_CASE_EACV, TARGET_USE_CASE_COUNT, MOVEMENT_TYPE
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
         WHERE MAPPED_THEATER = '{_theater()}'
-          AND FISCAL_QUARTER = 'FY2027-Q1'
-          AND MOVEMENT_TYPE IN ('Deployed', 'Created')
+AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
+               AND MOVEMENT_TYPE IN ('Deployed', 'Created')
           AND PRIORITIZED_FEATURE_UC IN (
               'Make Your Data AI Ready', 'Modernize Your Data Estate',
               'AI: Snowflake Intelligence & Agents')
@@ -1072,11 +1189,25 @@ def q_partner_sd_attach():
 
 
 def q_pipeline_movements():
-    """7-day pipeline movement metrics from pre-populated cache table.
-    Cache is built from vivun daily snapshots (SALES.SE_REPORTING) which
-    are not accessible in SiS. Refresh cache from CLI before each QC call."""
+    """7-day pipeline movement metrics from pre-computed cache table.
+    Cache is built from MDM.MDM_INTERFACES.DIM_USE_CASE_DAILY using day-over-day
+    LAG comparison to detect actual field-level changes.
+    Pushed out  = go-live was in current FQ, now moved past FQ end.
+    Pulled in   = go-live was outside current FQ, now moved into FQ.
+    Won to lost = stage changed to lost/not-in-pursuit (had go-live in FQ).
+    Imp started = stage moved into Implementation In Progress (go-live in FQ).
+    Won to imp  = stage moved from Won to Implementation (go-live in FQ).
+    Net new     = UC created in last 7 days with go-live in FQ."""
+    # Pipeline movements cache is a rolling 7-day snapshot — only meaningful for current quarter
+    empty = {k: {"count": 0, "acv": 0} for k in ("won_to_imp", "won_to_lost", "pushed_out", "pulled_in", "imp_started", "new_pipeline")}
+    if not CONFIG.get("is_current_quarter", True):
+        return empty
     gvp = CONFIG["gvp_name"]
-    rows = run_query(f"SELECT METRIC, CNT, ACV FROM SNOWPUBLIC.STREAMLIT.PIPELINE_MOVEMENTS_CACHE WHERE GVP = '{gvp}'")
+    rows = run_query(f"""
+        SELECT METRIC, CNT, ACV
+        FROM SNOWPUBLIC.STREAMLIT.PIPELINE_MOVEMENTS_CACHE
+        WHERE ACCOUNT_GVP = '{gvp}'
+    """)
     result = {}
     for r in rows:
         m = r.get("METRIC", "")
@@ -1089,72 +1220,36 @@ def q_pipeline_movements():
 
 
 def q_use_case_velocity():
-    def _parse_velocity_row(r):
-        if r and r.get("AVG_TW") is not None:
-            return {
-                "time_to_tw": safe_float(r["AVG_TW"]) if r["AVG_TW"] is not None else None,
-                "won_to_imp_start": safe_float(r["AVG_WON_TO_IMP"]) if r["AVG_WON_TO_IMP"] is not None else None,
-                "won_to_deployed": safe_float(r["AVG_WON_TO_DEPLOYED"]) if r["AVG_WON_TO_DEPLOYED"] is not None else None,
-            }
-        return {"time_to_tw": None, "won_to_imp_start": None, "won_to_deployed": None}
-
-    prior_quarters = CONFIG.get("prior_fy_quarters", [])
-    # DIM_USE_CASE_HISTORY_DS.TIME_WON_TO_DEPLOYED is stale — snapshot not refreshed since 2026-01-13.
-    # Use raven IMPLEMENTATION_START_DATE → DEFAULT_DATE (deployed) for imp-to-deployed.
-    # This avoids double-counting in risk thresholds (stage_4 = imp + deploy, stage_5 = deploy).
-    unions = [f"""
-        SELECT 'current' as PERIOD,
-               AVG(d.TIME_TO_TECH_WIN) as AVG_TW,
-               AVG(CASE WHEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) >= 0
-                    THEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) END) as AVG_WON_TO_IMP,
-               AVG(CASE WHEN u.IMPLEMENTATION_START_DATE IS NOT NULL AND u.DEFAULT_DATE IS NOT NULL
-                         AND DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) >= 0
-                    THEN DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) END) as AVG_WON_TO_DEPLOYED
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = TRUE
-          AND u.DEFAULT_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-    """]
-    if prior_quarters:
-        pq_start, pq_end = prior_quarters[-1]
-        unions.append(f"""
-        SELECT 'prior' as PERIOD,
-               AVG(d.TIME_TO_TECH_WIN) as AVG_TW,
-               AVG(CASE WHEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) >= 0
-                    THEN DATEDIFF('day', d.ACTUAL_USE_CASE_WON_DATE, d.IMPLEMENTATION_START_DATE) END) as AVG_WON_TO_IMP,
-               AVG(CASE WHEN u.IMPLEMENTATION_START_DATE IS NOT NULL AND u.DEFAULT_DATE IS NOT NULL
-                         AND DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) >= 0
-                    THEN DATEDIFF('day', u.IMPLEMENTATION_START_DATE, u.DEFAULT_DATE) END) as AVG_WON_TO_DEPLOYED
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = TRUE
-          AND u.DEFAULT_DATE BETWEEN '{pq_start}' AND '{pq_end}'
-        """)
-    rows = run_query(" UNION ALL ".join(unions))
-    row_map = {r["PERIOD"]: r for r in rows}
-    current = _parse_velocity_row(row_map.get("current"))
-    prior = _parse_velocity_row(row_map.get("prior")) if prior_quarters else {"time_to_tw": None, "won_to_imp_start": None, "won_to_deployed": None}
-    return {"current": current, "prior": prior}
+    """Stage transition velocity from pre-computed MDM cache.
+    Self-calculated DATEDIFFs for UCs created >= 2025-02-01, all stages.
+    Returns avg created-to-TW, TW-to-imp-start, imp-start-to-deployed."""
+    gvp = CONFIG["gvp_name"]
+    rows = run_query(f"""
+        SELECT AVG_TW, AVG_TW_TO_IMP, AVG_IMP_TO_DEPLOYED
+        FROM SNOWPUBLIC.STREAMLIT.VELOCITY_CACHE
+        WHERE ACCOUNT_GVP = '{gvp}' AND METRIC_TYPE = 'stage_transition'
+    """)
+    r = rows[0] if rows else {}
+    return {
+        "time_to_tw": safe_float(r.get("AVG_TW")) if r.get("AVG_TW") is not None else None,
+        "tw_to_imp_start": safe_float(r.get("AVG_TW_TO_IMP")) if r.get("AVG_TW_TO_IMP") is not None else None,
+        "imp_to_deployed": safe_float(r.get("AVG_IMP_TO_DEPLOYED")) if r.get("AVG_IMP_TO_DEPLOYED") is not None else None,
+    }
 
 
 def q_bronze_created_qtd():
     created_rows = run_query(f"""
         SELECT COUNT(*) as CREATED_COUNT
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["bronze_campaign"]}'
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.PRIORITIZED_FEATURES ILIKE '{CONFIG["bronze_feature"]}'
           AND u.CREATED_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
     """)
     created = safe_int(created_rows[0]["CREATED_COUNT"]) if created_rows else 0
     target_rows = run_query(f"""
         SELECT TARGET_USE_CASE_COUNT
         FROM SALES.REPORTING.SALES_PROGRAM_PRIORITIZED_FEATURES_TARGETS
-        WHERE MAPPED_THEATER = '{_theater()}' AND FISCAL_QUARTER = 'FY2027-Q1'
+        WHERE MAPPED_THEATER = '{_theater()}' AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
           AND MOVEMENT_TYPE = 'Created' AND PRIORITIZED_FEATURE_UC = 'Make Your Data AI Ready'
     """)
     target = safe_int(target_rows[0]["TARGET_USE_CASE_COUNT"]) if target_rows and target_rows[0]["TARGET_USE_CASE_COUNT"] else None
@@ -1162,14 +1257,12 @@ def q_bronze_created_qtd():
 
 
 def q_si_created_qtd():
-    """Count SI use cases created QTD using TECHNICAL_CAMPAIGN_S_C (same methodology as bronze)."""
+    """Count SI use cases created QTD using DIM_USE_CASE TECHNICAL_USE_CASE filter."""
     created_rows = run_query(f"""
         SELECT COUNT(*) as CREATED_COUNT
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND (u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["si_campaign_analyst"]}'
-               OR u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG["si_campaign_search"]}')
+        FROM {CONFIG["dim_uc_direct_table"]} u
+        WHERE u.THEATER_NAME = '{_theater()}'
+          AND u.TECHNICAL_USE_CASE ILIKE '{CONFIG["si_technical_uc"]}'
           AND u.CREATED_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
     """)
     return safe_int(created_rows[0]["CREATED_COUNT"]) if created_rows else 0
@@ -1186,14 +1279,14 @@ def q_current_pipeline_phases():
             CASE
                 WHEN u.IS_WENT_LIVE = TRUE AND u.DEFAULT_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
                     THEN 'Already Deployed'
-                WHEN u.IMPLEMENTATION_START_DATE <= CURRENT_DATE()
+                WHEN u.IMPLEMENTATION_START_DATE <= {CONFIG["reference_date"]}
                     AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE THEN 'In Implementation'
-                WHEN u.TECHNICAL_WIN_DATE_FORECAST_C <= CURRENT_DATE()
-                    AND (u.IMPLEMENTATION_START_DATE > CURRENT_DATE() OR u.IMPLEMENTATION_START_DATE IS NULL)
+                WHEN u.TECHNICAL_WIN_DATE_FORECAST_C <= {CONFIG["reference_date"]}
+                    AND (u.IMPLEMENTATION_START_DATE > {CONFIG["reference_date"]} OR u.IMPLEMENTATION_START_DATE IS NULL)
                     AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE THEN 'Post-TW / Pre-Imp'
-                WHEN u.CREATED_DATE <= CURRENT_DATE()
-                    AND (u.TECHNICAL_WIN_DATE_FORECAST_C > CURRENT_DATE() OR u.TECHNICAL_WIN_DATE_FORECAST_C IS NULL)
-                    AND (u.IMPLEMENTATION_START_DATE > CURRENT_DATE() OR u.IMPLEMENTATION_START_DATE IS NULL)
+                WHEN u.CREATED_DATE <= {CONFIG["reference_date"]}
+                    AND (u.TECHNICAL_WIN_DATE_FORECAST_C > {CONFIG["reference_date"]} OR u.TECHNICAL_WIN_DATE_FORECAST_C IS NULL)
+                    AND (u.IMPLEMENTATION_START_DATE > {CONFIG["reference_date"]} OR u.IMPLEMENTATION_START_DATE IS NULL)
                     AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE THEN 'Pre-TW'
                 ELSE 'Other'
             END as PIPELINE_PHASE,
@@ -2200,12 +2293,12 @@ PLAY_OPTIONS = {
 
 
 # =============================================================================
-# DATA LOADING (sequential, no ThreadPoolExecutor)
+# DATA LOADING (parallel with ThreadPoolExecutor)
 # =============================================================================
 
-def _run_all_queries(gvp_name):
+def _run_all_queries(gvp_name, quarter=None):
     CONFIG["gvp_name"] = gvp_name
-    total_steps = 30
+    total_steps = 10
     completed = [0]
     progress = st.progress(0, text="Connecting to Snowflake...")
 
@@ -2213,67 +2306,98 @@ def _run_all_queries(gvp_name):
         completed[0] += 1
         progress.progress(min(completed[0] / total_steps, 1.0), text=label)
 
-    _tick("Phase 1: Fiscal calendar...")
-    fiscal = q_fiscal_calendar()
+    # --- Phase 0: Sequential setup (sets CONFIG values needed by later queries) ---
+    _tick("Fiscal calendar & velocity...")
+    fiscal = q_fiscal_calendar(quarter_override=quarter)
     CONFIG["day_number"] = safe_int(fiscal["DAY_NUMBER"])
-
-    _tick("Phase 1.5: Use case velocity...")
     uc_velocity = q_use_case_velocity()
     update_risk_thresholds_from_velocity(uc_velocity)
 
-    _tick("QTD revenue...")
-    revenue = q_qtd_revenue()
-    _tick("Forecast calls...")
-    forecasts = q_forecast_calls()
-    _tick("Deployed QTD...")
-    deployed = q_deployed_qtd()
-    _tick("Last 7 days...")
-    last7 = q_last7_deployed()
-    _tick("Open pipeline...")
-    pipeline = q_open_pipeline()
-    _tick("Pipeline risk...")
-    risk_analysis = q_pipeline_risk()
-    _tick("Top 5 use cases...")
-    top5 = q_top5_use_cases()
-    _tick("Sales play summary...")
-    play_summary = q_sales_play_summary()
-    _tick("Play detail metrics...")
-    play_detail = q_play_detail_metrics()
-    _tick("Bronze TB total...")
-    bronze_tb_total = q_bronze_tb_total()
-    _tick("Play use cases...")
-    play_use_cases = q_play_use_cases()
-    _tick("Play risk detail...")
-    play_risk = q_play_risk_detail()
-    _tick("High risk UCs (Cortex AI)...")
-    high_risk_ucs = q_high_risk_use_cases()
-    _tick("Play targets...")
-    play_targets = q_play_targets()
-    _tick("Partner/SD attach...")
-    partner_sd = q_partner_sd_attach()
-    _tick("Pipeline movements (7d)...")
-    pipeline_movements = q_pipeline_movements()
-    _tick("Bronze created...")
-    bronze_created = q_bronze_created_qtd()
-    _tick("SI created...")
-    si_created = q_si_created_qtd()
-    _tick("SI theater totals...")
-    si_theater = q_si_theater_totals()
-    _tick("Bronze TB by account...")
-    bronze_tb_acct = q_bronze_tb_by_account()
-    _tick("Deployment velocity...")
-    velocity = q_deployment_velocity()
-    _tick("Risk-adjusted pipeline...")
-    pipeline_detail = q_risk_adjusted_pipeline_detail()
-    _tick("Pipeline phases...")
-    pipeline_phases = q_current_pipeline_phases()
-    _tick("Pacing...")
-    pacing = q_prior_fy_pacing(fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"])
-    _tick("Historical conversion rates...")
-    hist_conv_rates = q_historical_conversion_rates(fiscal["DAY_NUMBER"])
+    # --- Phase 1: Parallel independent queries ---
+    _tick("Loading data (parallel)...")
+    phase1_queries = {
+        "revenue": q_qtd_revenue,
+        "forecasts": q_forecast_calls,
+        "deployed": q_deployed_qtd,
+        "last7": q_last7_deployed,
+        "pipeline": q_open_pipeline,
+        "risk_analysis": q_pipeline_risk,
+        "top5": q_top5_use_cases,
+        "play_summary": q_sales_play_summary,
+        "play_detail": q_play_detail_metrics,
+        "bronze_tb_total": q_bronze_tb_total,
+        "bronze_tb_target": q_bronze_tb_target,
+        "play_use_cases": q_play_use_cases,
+        "play_risk": q_play_risk_detail,
+        "high_risk_ucs": q_high_risk_use_cases,
+        "play_targets": q_play_targets,
+        "partner_sd": q_partner_sd_attach,
+        "pipeline_movements": q_pipeline_movements,
+        "bronze_created": q_bronze_created_qtd,
+        "si_created": q_si_created_qtd,
+        "si_theater": q_si_theater_totals,
+        "bronze_tb_acct": q_bronze_tb_by_account,
+        "velocity": q_deployment_velocity,
+        "pipeline_detail": q_risk_adjusted_pipeline_detail,
+        "pipeline_phases": q_current_pipeline_phases,
+        "cc_theater": q_cortex_code_theater_usage,
+    }
+    # Queries that need fiscal calendar results
+    phase1_with_args = {
+        "pacing": lambda: q_prior_fy_pacing(fiscal["DAY_NUMBER"], fiscal["WEEK_NUMBER"]),
+        "hist_conv_rates": lambda: q_historical_conversion_rates(fiscal["DAY_NUMBER"]),
+    }
+    all_phase1 = {**phase1_queries, **phase1_with_args}
+    p1_results = {}
+    p1_errors = {}
 
-    # Consumption & SI usage (need account IDs from prior queries)
-    _tick("Consumption & SI usage...")
+    with ThreadPoolExecutor(max_workers=26) as executor:
+        futures = {executor.submit(fn): name for name, fn in all_phase1.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                p1_results[name] = future.result()
+            except Exception as e:
+                p1_errors[name] = e
+                p1_results[name] = {} if name not in ("top5", "play_use_cases") else ([] if name == "top5" else {})
+
+    if p1_errors:
+        for name, err in p1_errors.items():
+            st.warning(f"Query '{name}' failed: {err}")
+
+    _tick("Phase 1 complete...")
+
+    # Unpack results
+    revenue = p1_results["revenue"]
+    forecasts = p1_results["forecasts"]
+    deployed = p1_results["deployed"]
+    last7 = p1_results["last7"]
+    pipeline = p1_results["pipeline"]
+    risk_analysis = p1_results["risk_analysis"]
+    top5 = p1_results["top5"]
+    play_summary = p1_results["play_summary"]
+    play_detail = p1_results["play_detail"]
+    bronze_tb_total = p1_results["bronze_tb_total"]
+    bronze_tb_target_val = p1_results["bronze_tb_target"]
+    play_use_cases = p1_results["play_use_cases"]
+    play_risk = p1_results["play_risk"]
+    high_risk_ucs = p1_results["high_risk_ucs"]
+    play_targets = p1_results["play_targets"]
+    partner_sd = p1_results["partner_sd"]
+    pipeline_movements = p1_results["pipeline_movements"]
+    bronze_created = p1_results["bronze_created"]
+    si_created = p1_results["si_created"]
+    si_theater = p1_results["si_theater"]
+    bronze_tb_acct = p1_results["bronze_tb_acct"]
+    velocity = p1_results["velocity"]
+    pipeline_detail = p1_results["pipeline_detail"]
+    pipeline_phases = p1_results["pipeline_phases"]
+    cc_theater = p1_results["cc_theater"]
+    pacing = p1_results["pacing"]
+    hist_conv_rates = p1_results["hist_conv_rates"]
+
+    # --- Phase 2: Queries that depend on Phase 1 account IDs (parallel) ---
+    _tick("Account-level queries...")
     all_account_ids = set()
     for uc in top5:
         all_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
@@ -2285,18 +2409,32 @@ def _run_all_queries(gvp_name):
     for uc in play_use_cases.get("si", []):
         si_account_ids.add(safe_str(uc.get("ACCOUNT_ID")))
     si_account_ids.discard("")
-    consumption = q_consumption(all_account_ids)
-    si_usage = q_si_usage(si_account_ids)
 
-    # Cortex Code usage
-    _tick("Cortex Code usage...")
-    cc_theater = q_cortex_code_theater_usage()
-    cc_by_account = q_cortex_code_by_account(all_account_ids)
+    phase2_queries = {
+        "consumption": lambda: q_consumption(all_account_ids),
+        "si_usage": lambda: q_si_usage(si_account_ids),
+        "cc_by_account": lambda: q_cortex_code_by_account(all_account_ids),
+    }
+    p2_results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fn): name for name, fn in phase2_queries.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                p2_results[name] = future.result()
+            except Exception as e:
+                st.warning(f"Query '{name}' failed: {e}")
+                p2_results[name] = {}
 
+    consumption = p2_results["consumption"]
+    si_usage = p2_results["si_usage"]
+    cc_by_account = p2_results["cc_by_account"]
+
+    # --- Phase 3: Forecast computation (local, no SQL) ---
     _tick("Forecast models...")
     forecast_analysis = compute_forecast_analysis(
         pipeline_phases, hist_conv_rates, deployed, risk_analysis,
-        forecasts["most_likely"], pacing
+        forecasts.get("most_likely", 0) if isinstance(forecasts, dict) else 0, pacing
     )
     _tick("Backtest models...")
     backtest_results = q_backtest_models(hist_conv_rates)
@@ -2316,7 +2454,7 @@ def _run_all_queries(gvp_name):
         "play_summary": play_summary, "play_detail": play_detail,
         "play_use_cases": play_use_cases, "play_risk": play_risk,
         "high_risk_ucs": high_risk_ucs, "consumption": consumption,
-        "bronze_tb_total": bronze_tb_total, "bronze_tb_acct": bronze_tb_acct,
+        "bronze_tb_total": bronze_tb_total, "bronze_tb_target": bronze_tb_target_val, "bronze_tb_acct": bronze_tb_acct,
         "si_usage": si_usage, "si_theater": si_theater, "pacing": pacing,
         "forecast_analysis": forecast_analysis, "play_targets": play_targets,
         "partner_sd": partner_sd, "uc_velocity": uc_velocity,
@@ -2336,19 +2474,22 @@ def _run_all_queries(gvp_name):
             "days_to_imp": CONFIG.get("days_to_imp"),
             "days_to_deploy": CONFIG.get("days_to_deploy"),
             "risk_thresholds": CONFIG.get("risk_thresholds"),
+            "is_current_quarter": CONFIG.get("is_current_quarter"),
+            "reference_date": CONFIG.get("reference_date"),
         },
         "_loaded_at": datetime.now(),
     }
 
 
-def load_all_data(gvp_name):
-    cache_key = f"peak_data_{gvp_name}"
+def load_all_data(gvp_name, quarter=None):
+    q_label = quarter["label"] if quarter else "current"
+    cache_key = f"peak_data_{gvp_name}_{q_label}"
     cached = st.session_state.get(cache_key)
     if cached is not None:
         loaded_at = cached.get("_loaded_at")
         if loaded_at and (datetime.now() - loaded_at).total_seconds() < 600:
             return cached
-    data = _run_all_queries(gvp_name)
+    data = _run_all_queries(gvp_name, quarter=quarter)
     st.session_state[cache_key] = data
     return data
 
@@ -2521,24 +2662,13 @@ def render_script_tab(data, selected_play_key):
     partner_ps_total = partner_sd.get("partner_or_ps_accounts", 0)
     partner_ps_cc = partner_sd.get("partner_or_ps_cc_count", 0)
     partner_ps_cc_pct = round(partner_ps_cc / partner_ps_total * 100, 1) if partner_ps_total else 0
-    uc_vel_cur = uc_velocity.get("current", {})
-    uc_vel_prior = uc_velocity.get("prior", {})
-    v_tw = uc_vel_cur.get("time_to_tw")
-    v_imp = uc_vel_cur.get("won_to_imp_start")
-    v_dep = uc_vel_cur.get("won_to_deployed")
+    uc_vel = uc_velocity
+    v_tw = uc_vel.get("time_to_tw")
+    v_imp = uc_vel.get("tw_to_imp_start")
+    v_dep = uc_vel.get("imp_to_deployed")
     v_tw_str = f"{v_tw:.0f}" if v_tw is not None and not _is_nan(v_tw) else "N/A"
     v_imp_str = f"{v_imp:.0f}" if v_imp is not None and not _is_nan(v_imp) else "N/A"
     v_dep_str = f"{v_dep:.0f}" if v_dep is not None and not _is_nan(v_dep) else "N/A"
-    pq_label = cfg.get("prior_fy_label", "Prior") + " Q4"
-
-    def _vel_prior_sub(cur, prior_val):
-        if prior_val is None or _is_nan(prior_val):
-            return ""
-        return f'<span style="display: block; font-size: 0.45em; color: #888; margin-top: 4px;">{pq_label}: {prior_val:.0f}</span>'
-
-    v_tw_prior = _vel_prior_sub(v_tw, uc_vel_prior.get("time_to_tw"))
-    v_imp_prior = _vel_prior_sub(v_imp, uc_vel_prior.get("won_to_imp_start"))
-    v_dep_prior = _vel_prior_sub(v_dep, uc_vel_prior.get("won_to_deployed"))
     high_risk_table_html = build_high_risk_table_html(high_risk_ucs)
 
     # Pipeline movement variables (7-day)
@@ -2647,13 +2777,13 @@ SD attach rate is <strong>{fmt_pct(sd_rate)}</strong>
 The remaining <strong>{unassisted_cnt}</strong> use cases ({fmt_currency(unassisted_acv)} ACV, {fmt_pct(unassisted_rate)}) are unassisted (Customer Only, Unknown, or None).
 Of the <strong>{partner_ps_total}</strong> accounts with Partner or PS-attached use cases, <strong>{partner_ps_cc}</strong> (<strong>{partner_ps_cc_pct}%</strong>) are actively using Cortex Code CLI.</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Use Case Velocity</h3>
-<p>For use cases that went live this quarter, our average velocity metrics are:</p>
+<p>Average stage transition times for use cases created since FY26 Q1 (all stages):</p>
 <div class="timeline-box">
-  <div class="timeline-item"><span class="timeline-label">Days to TW</span><span class="timeline-days">{v_tw_str}{v_tw_prior}</span></div>
+  <div class="timeline-item"><span class="timeline-label">Created to TW</span><span class="timeline-days">{v_tw_str}</span></div>
   <div class="timeline-arrow">&rarr;</div>
-  <div class="timeline-item"><span class="timeline-label">Days to Imp Start</span><span class="timeline-days">{v_imp_str}{v_imp_prior}</span></div>
+  <div class="timeline-item"><span class="timeline-label">TW to Imp Start</span><span class="timeline-days">{v_imp_str}</span></div>
   <div class="timeline-arrow">&rarr;</div>
-  <div class="timeline-item"><span class="timeline-label">Days to Deployed</span><span class="timeline-days">{v_dep_str}{v_dep_prior}</span></div>
+  <div class="timeline-item"><span class="timeline-label">Imp Start to Deployed</span><span class="timeline-days">{v_dep_str}</span></div>
 </div>
 </div>"""
     st.html(STREAMLIT_CSS + script_html)
@@ -2742,9 +2872,9 @@ def render_golives_tab(data):
 
     # Row 2: Bronze - DCT TBs Ingested
     br_tb_actual = bronze_tb_total
-    br_tb_target = None  # Not available in Snowflake
-    br_tb_target_str = "&mdash;"
-    br_tb_att = "&mdash;"
+    br_tb_target = data.get("bronze_tb_target")
+    br_tb_target_str = f"{br_tb_target:,.0f} TB" if br_tb_target is not None else "&mdash;"
+    br_tb_att = _sp_attainment(br_tb_actual, br_tb_target)
 
     # Row 3: SI - Use Cases Created
     si_created_actual = si_created
@@ -2902,11 +3032,15 @@ def render_golives_tab(data):
 
 
 def render_forecast_tab(data):
+    is_current = data["_config"].get("is_current_quarter", True)
+    fiscal = data["fiscal"]
+    day_number = safe_int(fiscal["DAY_NUMBER"])
+    if not is_current and day_number == 0:
+        st.info("Forecast analysis is not available for future quarters — no deployment data to extrapolate from.")
+        return
     forecast_analysis = data["forecast_analysis"]
     forecasts = data["forecasts"]
     deployed = data["deployed"]
-    fiscal = data["fiscal"]
-    day_number = safe_int(fiscal["DAY_NUMBER"])
     week_number = safe_int(fiscal["WEEK_NUMBER"])
     forecast_html = _build_forecast_tab(forecast_analysis, forecasts, deployed, day_number, week_number)
     st.html(STREAMLIT_CSS + forecast_html)
@@ -2926,7 +3060,7 @@ st.set_page_config(
 # =============================================================================
 # ACCESS CONTROL — restrict to approved users
 # =============================================================================
-ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH"}
+ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH", "NTSUI", "ADANNA"}
 
 def _check_access():
     """Verify the current user is in the approved access list."""
@@ -2934,6 +3068,8 @@ def _check_access():
         "nate.thomas@snowflake.com",
         "saskia.vandaal@snowflake.com",
         "matt.meredith@snowflake.com",
+        "nick.tsui@snowflake.com",
+        "alex.danna@snowflake.com",
     }
     try:
         user_email = st.user.get("email", "").lower()
@@ -2961,6 +3097,16 @@ def main():
             index=GVP_OPTIONS.index("Mark Fleming"),
             help="Select GVP to view. Changing GVP reloads all data.",
         )
+        # Quarter selector
+        quarter_opts = _build_quarter_options()
+        quarter_labels = [q["label"] for q in quarter_opts]
+        current_q = _current_quarter_label()
+        default_idx = quarter_labels.index(current_q) if current_q in quarter_labels else 0
+        selected_quarter_label = st.selectbox(
+            "Fiscal Quarter", options=quarter_labels, index=default_idx,
+            help="Select fiscal quarter. Defaults to current quarter.",
+        )
+        selected_quarter = next(q for q in quarter_opts if q["label"] == selected_quarter_label)
         play_labels = list(PLAY_OPTIONS.keys())
         selected_play_label = st.selectbox(
             "Sales Play (Script tab only)", options=play_labels, index=0,
@@ -2968,7 +3114,7 @@ def main():
             help="Select which Sales Play to feature in the Script tab.",
         )
         st.markdown("---")
-        cache_key = f"peak_data_{selected_gvp}"
+        cache_key = f"peak_data_{selected_gvp}_{selected_quarter_label}"
         cached = st.session_state.get(cache_key)
         if cached and cached.get("_loaded_at"):
             last_refresh = cached["_loaded_at"].strftime('%H:%M:%S')
@@ -2981,7 +3127,7 @@ def main():
                     del st.session_state[key]
             st.rerun()
 
-    data = load_all_data(selected_gvp)
+    data = load_all_data(selected_gvp, selected_quarter)
     for k, v in data["_config"].items():
         if v is not None:
             CONFIG[k] = v
@@ -2991,9 +3137,17 @@ def main():
     qstart = safe_str(fiscal["FQ_START"])
     qend = safe_str(fiscal["FQ_END"])
     days_remaining = safe_int(fiscal["DAYS_REMAINING"])
+    is_current = data["_config"].get("is_current_quarter", True)
 
     st.markdown(f"## PEAK Forecasting — {selected_gvp}")
-    st.markdown(f"**{quarter}** ({qstart} - {qend}) | **{days_remaining} days remaining**")
+    if is_current:
+        st.markdown(f"**{CONFIG['fiscal_quarter']}** ({qstart} - {qend}) | **{days_remaining} days remaining**")
+    elif days_remaining == 0:
+        st.markdown(f"**{CONFIG['fiscal_quarter']}** ({qstart} - {qend}) | *Quarter complete*")
+    else:
+        from datetime import date
+        days_until = (date.fromisoformat(qstart) - date.today()).days
+        st.markdown(f"**{CONFIG['fiscal_quarter']}** ({qstart} - {qend}) | *Starts in {days_until} days*")
 
     tab_script, tab_golives, tab_forecast = st.tabs([
         "Script", "Use Case Go-Lives", "Forecast Analysis",
