@@ -119,8 +119,8 @@ RISK_CATEGORIES = [
 # GVP to theater name mapping
 GVP_THEATER_MAP = {
     "Mark Fleming": "AMSExpansion",
-    "Jennifer Chronis": "USMajors",
-    "Jonathan Beaulier": "USPubSec",
+    "Jennifer Chronis": "USPubSec",
+    "Jonathan Beaulier": "USMajors",
     "Keegan Riley": "AMSAcquisition",
     "Jon Robertson": "APJ",
     "Dayne Turbitt": "EMEA",
