@@ -3067,6 +3067,7 @@ def _check_access():
         "matt.meredith@snowflake.com",
         "nick.tsui@snowflake.com",
         "alex.danna@snowflake.com",
+        "jocqui.smollett@snowflake.com",
     }
     try:
         user_email = st.user.get("email", "").lower()
