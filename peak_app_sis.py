@@ -399,12 +399,13 @@ def q_fiscal_calendar(selected_quarter):
 
 
 def q_regional_targets():
-    """Fetch GVP-level targets from VP_REGIONAL_TARGETS_VIEW."""
+    """Fetch GVP-level targets from GVP_TARGET_CACHE."""
     fq_key = CONFIG["fiscal_quarter_key"]
+    gvp = CONFIG["gvp_name"]
     rows = run_query(f"""
         SELECT TARGET_TYPE, TARGET_VALUE
-        FROM SALES.REPORTING.VP_REGIONAL_TARGETS_VIEW
-        WHERE OWNER_NAME = '{CONFIG["gvp_name"]}'
+        FROM SNOWPUBLIC.STREAMLIT.GVP_TARGET_CACHE
+        WHERE OWNER_NAME = '{gvp}'
           AND TARGET_LEVEL = 'GVP'
           AND FISCAL_QUARTER = '{fq_key}'
     """)
@@ -2330,7 +2331,6 @@ def _run_all_queries(gvp_name, selected_quarter):
         "pipeline_detail": q_risk_adjusted_pipeline_detail,
         "pipeline_phases": q_current_pipeline_phases,
         "cc_theater": q_cortex_code_theater_usage,
-        "regional_targets": q_regional_targets,
     }
     # Queries that need fiscal calendar results
     phase1_with_args = {
@@ -2385,7 +2385,12 @@ def _run_all_queries(gvp_name, selected_quarter):
     cc_theater = p1_results["cc_theater"]
     pacing = p1_results["pacing"]
     hist_conv_rates = p1_results["hist_conv_rates"]
-    regional_targets = p1_results.get("regional_targets", {})
+    # Fetch regional targets synchronously (outside thread pool for SiS compatibility)
+    try:
+        regional_targets = q_regional_targets()
+    except Exception as e:
+        st.warning(f"Regional targets query failed: {e}")
+        regional_targets = {}
 
     # Populate targets from VP_REGIONAL_TARGETS_VIEW (go-live) and PEAK_FORECAST (revenue/consumption)
     forecasts["target"] = regional_targets.get("Use Case Go Live", 0)
