@@ -6,8 +6,10 @@ Combines all query functions, helpers, and rendering from peak_report.py + peak_
 into a single standalone file compatible with Snowpark session execution.
 """
 
+import math
 import os
 import re
+import statistics
 import time
 import html as html_lib
 from datetime import datetime, date
@@ -106,7 +108,7 @@ CONFIG = {
     "risk_thresholds": {"stage_123": 146, "stage_4": 104, "stage_5": 79},
     "raven_uc_table": "SALES.RAVEN.USE_CASE_EXPLORER_VH_DELIVERABLE_C",
     "raven_acct_table": "SALES.RAVEN.D_SALESFORCE_ACCOUNT_CUSTOMERS",
-    "dim_uc_table": "(SELECT * FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS WHERE DS = (SELECT MAX(DS) FROM SALES.REPORTING.DIM_USE_CASE_HISTORY_DS))",
+    "dim_uc_table": "(SELECT * FROM SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW WHERE DS = (SELECT MAX(DS) FROM SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW))",
 }
 
 RISK_CATEGORIES = [
@@ -349,22 +351,21 @@ def q_fiscal_calendar(selected_quarter):
         "FQ_END": fq_end,
     }
 
-    # Compute day/week number relative to reference_date
-    day_rows = run_query(f"""
-        SELECT DATEDIFF('day', '{fq_start}'::DATE, {ref_date}) + 1 AS DAY_NUMBER,
-               CEIL((DATEDIFF('day', '{fq_start}'::DATE, {ref_date}) + 1) / 7.0) AS WEEK_NUMBER
-    """)
-    day_number = safe_int(day_rows[0].get("DAY_NUMBER", 0)) if day_rows else 0
-    week_number = safe_int(day_rows[0].get("WEEK_NUMBER", 0)) if day_rows else 0
+    # Compute day/week number and days remaining in Python (no SQL needed)
+    _fq_start_d = date.fromisoformat(fq_start)
+    _fq_end_d = date.fromisoformat(fq_end)
+    if selected_quarter["is_current"]:
+        _ref_d = date.today()
+    elif _fq_end_d < date.today():
+        _ref_d = _fq_end_d
+    else:
+        _ref_d = _fq_start_d
+    day_number = (_ref_d - _fq_start_d).days + 1
+    week_number = math.ceil(day_number / 7.0)
     fiscal["DAY_NUMBER"] = day_number
     fiscal["WEEK_NUMBER"] = week_number
-
-    # Days remaining from reference_date to quarter end
-    fiscal["DAYS_REMAINING"] = None
-    dr_rows = run_query(f"SELECT DATEDIFF('day', {ref_date}, '{fq_end}'::DATE) + 1 AS DAYS_REMAINING")
-    if dr_rows:
-        fiscal["DAYS_REMAINING"] = safe_int(dr_rows[0].get("DAYS_REMAINING", 0))
-        CONFIG["days_remaining"] = fiscal["DAYS_REMAINING"]
+    fiscal["DAYS_REMAINING"] = (_fq_end_d - _ref_d).days + 1
+    CONFIG["days_remaining"] = fiscal["DAYS_REMAINING"]
 
     # Prior FY quarters: FY starts Feb 1, so prior FY = fy-1
     prior_fy_start_year = fy - 2  # calendar year when prior FY starts (Feb)
@@ -397,6 +398,19 @@ def q_fiscal_calendar(selected_quarter):
     return fiscal
 
 
+def q_regional_targets():
+    """Fetch GVP-level targets from VP_REGIONAL_TARGETS_VIEW."""
+    fq_key = CONFIG["fiscal_quarter_key"]
+    rows = run_query(f"""
+        SELECT TARGET_TYPE, TARGET_VALUE
+        FROM SALES.REPORTING.VP_REGIONAL_TARGETS_VIEW
+        WHERE OWNER_NAME = '{CONFIG["gvp_name"]}'
+          AND TARGET_LEVEL = 'GVP'
+          AND FISCAL_QUARTER = '{fq_key}'
+    """)
+    return {r["TARGET_TYPE"]: safe_float(r["TARGET_VALUE"]) for r in rows}
+
+
 def q_qtd_revenue():
     fq_key = CONFIG["fiscal_quarter_key"]
     rows = run_query(f"""
@@ -408,7 +422,7 @@ def q_qtd_revenue():
           AND FISCAL_QUARTER = '{fq_key}'
           AND LATEST_DATE = TRUE
     """)
-    assert len(rows) == 3, f"Expected 3 revenue rows, got {len(rows)}"
+    assert len(rows) >= 3, f"Expected at least 3 revenue rows, got {len(rows)}"
     revenue_map = {r["FORECAST_TYPE"]: safe_float(r["FORECAST_AMOUNT"]) for r in rows}
     fy = CONFIG["fiscal_year"]
     fy_rows = run_query(f"""
@@ -423,9 +437,8 @@ def q_qtd_revenue():
     """)
     return {
         "revenue": revenue_map.get("Actual", 0),
-        "target": "TBD",
-        "pct_target": "TBD",
         "q1_forecast": revenue_map.get("Total", 0),
+        "target": revenue_map.get("Target", 0),
         "fy_forecast": float(fy_rows[0]["FY_FORECAST"]),
     }
 
@@ -438,7 +451,7 @@ def q_forecast_calls():
         WHERE USER_NAME = '{CONFIG["gvp_name"]}'
           AND FUNCTION = '{CONFIG["gvp_function"]}'
           AND TYPE = 'Use Case Go-Lives'
-          AND FORECAST_TYPE IN ('CommitForecast', 'MostLikelyForecast', 'BestCaseForecast', 'Target')
+          AND FORECAST_TYPE IN ('CommitForecast', 'MostLikelyForecast', 'BestCaseForecast')
           AND FISCAL_QUARTER = '{fq_key}'
           AND (LATEST_DATE = TRUE OR PREVIOUS_WEEK = TRUE)
     """)
@@ -456,7 +469,6 @@ def q_forecast_calls():
         "commit": commit,
         "most_likely": ml,
         "stretch": stretch,
-        "target": current.get("Target", 0),
         "commit_delta": commit - prior["CommitForecast"] if "CommitForecast" in prior else None,
         "ml_delta": ml - prior["MostLikelyForecast"] if "MostLikelyForecast" in prior else None,
         "stretch_delta": stretch - prior["BestCaseForecast"] if "BestCaseForecast" in prior else None,
@@ -656,71 +668,92 @@ def q_top5_use_cases():
     """)
 
 
-def _play_summary_query(play_name, extra_join, filter_clause, is_deployed):
+def q_sales_play_summary():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
-    if is_deployed:
-        deploy_filter = "u.IS_WENT_LIVE = TRUE"
-        date_filter = f"u.DEFAULT_DATE BETWEEN '{CONFIG['quarter_start']}' AND '{CONFIG['quarter_end']}'"
-        stage_filter = ""
-    else:
-        deploy_filter = "u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE"
-        date_filter = f"u.GO_LIVE_DATE BETWEEN '{CONFIG['quarter_start']}' AND '{CONFIG['quarter_end']}'"
-        stage_filter = f"AND u.USE_CASE_STAGE NOT IN ({excluded})"
-    rows = run_query(f"""
-        SELECT SUM(u.USE_CASE_ACV) as ACV, COUNT(*) as COUNT_
+    bronze_camp = CONFIG['bronze_campaign']
+    sql_camp = CONFIG['sqlserver_campaign']
+    si_tuc = CONFIG['si_technical_use_case']
+    # Open pipeline — 1 query for all 3 plays
+    open_rows = run_query(f"""
+        SELECT
+            COALESCE(SUM(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{bronze_camp}' THEN u.USE_CASE_ACV END), 0) as BRONZE_ACV,
+            COUNT(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{bronze_camp}' THEN 1 END) as BRONZE_COUNT,
+            COALESCE(SUM(CASE WHEN d.TECHNICAL_USE_CASE ILIKE '{si_tuc}' THEN u.USE_CASE_ACV END), 0) as SI_ACV,
+            COUNT(CASE WHEN d.TECHNICAL_USE_CASE ILIKE '{si_tuc}' THEN 1 END) as SI_COUNT,
+            COALESCE(SUM(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{sql_camp}' THEN u.USE_CASE_ACV END), 0) as SQL_ACV,
+            COUNT(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{sql_camp}' THEN 1 END) as SQL_COUNT
         FROM {CONFIG["raven_uc_table"]} u
         JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
+        LEFT JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
         WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND {deploy_filter} AND {date_filter}
-          {stage_filter} AND {filter_clause}
+          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
+          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+          AND u.USE_CASE_STAGE NOT IN ({excluded})
     """)
-    r = rows[0]
-    return {"acv": safe_float(r["ACV"] or 0), "count": safe_int(r["COUNT_"] or 0)}
-
-
-def q_sales_play_summary():
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
-    bronze_filter = f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"
-    sql_filter = f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"
-    si_filter = f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"
-    result = {}
-    for play, extra_join, filt in [
-        ("bronze", "", bronze_filter),
-        ("si", dim_join, si_filter),
-        ("sqlserver", "", sql_filter),
-    ]:
-        result[f"{play}_open"] = _play_summary_query(play, extra_join, filt, False)
-        result[f"{play}_deployed"] = _play_summary_query(play, extra_join, filt, True)
-    return result
+    # Deployed — 1 query for all 3 plays
+    dep_rows = run_query(f"""
+        SELECT
+            COALESCE(SUM(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{bronze_camp}' THEN u.USE_CASE_ACV END), 0) as BRONZE_ACV,
+            COUNT(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{bronze_camp}' THEN 1 END) as BRONZE_COUNT,
+            COALESCE(SUM(CASE WHEN d.TECHNICAL_USE_CASE ILIKE '{si_tuc}' THEN u.USE_CASE_ACV END), 0) as SI_ACV,
+            COUNT(CASE WHEN d.TECHNICAL_USE_CASE ILIKE '{si_tuc}' THEN 1 END) as SI_COUNT,
+            COALESCE(SUM(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{sql_camp}' THEN u.USE_CASE_ACV END), 0) as SQL_ACV,
+            COUNT(CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{sql_camp}' THEN 1 END) as SQL_COUNT
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        LEFT JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = TRUE
+          AND u.DEFAULT_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+    """)
+    o = open_rows[0]
+    dp = dep_rows[0]
+    return {
+        "bronze_open": {"acv": safe_float(o["BRONZE_ACV"]), "count": safe_int(o["BRONZE_COUNT"])},
+        "bronze_deployed": {"acv": safe_float(dp["BRONZE_ACV"]), "count": safe_int(dp["BRONZE_COUNT"])},
+        "si_open": {"acv": safe_float(o["SI_ACV"]), "count": safe_int(o["SI_COUNT"])},
+        "si_deployed": {"acv": safe_float(dp["SI_ACV"]), "count": safe_int(dp["SI_COUNT"])},
+        "sqlserver_open": {"acv": safe_float(o["SQL_ACV"]), "count": safe_int(o["SQL_COUNT"])},
+        "sqlserver_deployed": {"acv": safe_float(dp["SQL_ACV"]), "count": safe_int(dp["SQL_COUNT"])},
+    }
 
 
 def q_play_detail_metrics():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
-    dim_join = f"JOIN {CONFIG['dim_uc_table']} d ON u.ID = d.USE_CASE_ID"
-
-    def _run(extra_join, filter_clause):
-        rows = run_query(f"""
-            SELECT COUNT(*) as OPEN_COUNT, AVG(u.USE_CASE_ACV) as AVG_ACV,
-                   MEDIAN(u.USE_CASE_ACV) as MEDIAN_ACV,
-                   COUNT(DISTINCT a.SALES_AREA) as REGION_COUNT
-            FROM {CONFIG["raven_uc_table"]} u
-            JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-            {extra_join}
-            WHERE a.GVP = '{CONFIG["gvp_name"]}'
-              AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-              AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-              AND u.USE_CASE_STAGE NOT IN ({excluded}) AND {filter_clause}
-        """)
-        r = rows[0]
+    bronze_camp = CONFIG['bronze_campaign']
+    sql_camp = CONFIG['sqlserver_campaign']
+    si_tuc = CONFIG['si_technical_use_case']
+    # Single query: fetch per-UC rows with play labels, compute median in Python
+    rows = run_query(f"""
+        SELECT u.USE_CASE_ACV,
+               a.SALES_AREA,
+               CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{bronze_camp}' THEN 1 ELSE 0 END AS IS_BRONZE,
+               CASE WHEN d.TECHNICAL_USE_CASE ILIKE '{si_tuc}' THEN 1 ELSE 0 END AS IS_SI,
+               CASE WHEN u.TECHNICAL_CAMPAIGN_S_C ILIKE '{sql_camp}' THEN 1 ELSE 0 END AS IS_SQL
+        FROM {CONFIG["raven_uc_table"]} u
+        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+        LEFT JOIN {CONFIG["dim_uc_table"]} d ON u.ID = d.USE_CASE_ID
+        WHERE a.GVP = '{CONFIG["gvp_name"]}'
+          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
+          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+          AND u.USE_CASE_STAGE NOT IN ({excluded})
+    """)
+    def _calc(flag_col):
+        filtered = [r for r in rows if r[flag_col] == 1]
+        if not filtered:
+            return {"count": 0, "avg_acv": 0, "median_acv": 0, "regions": 0}
+        acvs = [safe_float(r["USE_CASE_ACV"]) for r in filtered]
+        regions = len(set(safe_str(r["SALES_AREA"]) for r in filtered if r.get("SALES_AREA")))
         return {
-            "count": safe_int(r["OPEN_COUNT"] or 0), "avg_acv": safe_float(r["AVG_ACV"] or 0),
-            "median_acv": safe_float(r["MEDIAN_ACV"] or 0), "regions": safe_int(r["REGION_COUNT"] or 0),
+            "count": len(acvs),
+            "avg_acv": sum(acvs) / len(acvs),
+            "median_acv": statistics.median(acvs),
+            "regions": regions,
         }
     return {
-        "bronze": _run("", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['bronze_campaign']}'"),
-        "si": _run(dim_join, f"d.TECHNICAL_USE_CASE ILIKE '{CONFIG['si_technical_use_case']}'"),
-        "sqlserver": _run("", f"u.TECHNICAL_CAMPAIGN_S_C ILIKE '{CONFIG['sqlserver_campaign']}'"),
+        "bronze": _calc("IS_BRONZE"),
+        "si": _calc("IS_SI"),
+        "sqlserver": _calc("IS_SQL"),
     }
 
 
@@ -736,16 +769,20 @@ def q_bronze_tb_total():
 
 
 def q_tb_ingested_target():
-    rows = run_query(f"""
-        SELECT GOAL
-        FROM SALES.SALES_BI.SALES_PROGRAMS_SUCCESS_GOALS
-        WHERE GOAL_TYPE = 'TB Ingested'
-          AND TAG_VALUE = 'Make Your Data AI Ready'
-          AND THEATER = '{_theater()}'
-          AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
-    """)
-    if rows and rows[0]["GOAL"] is not None:
-        return float(rows[0]["GOAL"])
+    """TB Ingested target from SUCCESS_GOALS. Returns None if not accessible."""
+    try:
+        rows = run_query(f"""
+            SELECT GOAL
+            FROM SALES.SALES_BI.SALES_PROGRAMS_SUCCESS_GOALS
+            WHERE GOAL_TYPE = 'TB Ingested'
+              AND TAG_VALUE = 'Make Your Data AI Ready'
+              AND THEATER = '{_theater()}'
+              AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
+        """, _retries=0)
+        if rows and rows[0]["GOAL"] is not None:
+            return float(rows[0]["GOAL"])
+    except Exception:
+        pass
     return None
 
 
@@ -956,32 +993,30 @@ def q_bronze_tb_by_account():
 
 def _play_risk_detail_query(play_name, extra_join, filter_clause):
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
-    risk_rows = run_query(f"""
-        SELECT a.SALESFORCE_ACCOUNT_NAME as ACCOUNT_NAME, u.VH_NAME_C as USE_CASE_NAME,
-               u.USE_CASE_ACV as USE_CASE_EACV, u.USE_CASE_RISK_C as USE_CASE_RISK,
-               u.USE_CASE_COMMENTS_C as SE_COMMENTS, u.NEXT_STEP_C as NEXT_STEPS, u.USE_CASE_STAGE
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded})
-          AND u.USE_CASE_RISK_C IS NOT NULL AND u.USE_CASE_RISK_C != '' AND u.USE_CASE_RISK_C != 'None'
-          AND {filter_clause}
-        ORDER BY u.USE_CASE_ACV DESC
+    # Use CTE to get total count and risk rows in a single round trip
+    rows = run_query(f"""
+        WITH base AS (
+            SELECT a.SALESFORCE_ACCOUNT_NAME as ACCOUNT_NAME, u.VH_NAME_C as USE_CASE_NAME,
+                   u.USE_CASE_ACV as USE_CASE_EACV, u.USE_CASE_RISK_C as USE_CASE_RISK,
+                   u.USE_CASE_COMMENTS_C as SE_COMMENTS, u.NEXT_STEP_C as NEXT_STEPS, u.USE_CASE_STAGE,
+                   COUNT(*) OVER() as TOTAL_ALL
+            FROM {CONFIG["raven_uc_table"]} u
+            JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
+            {extra_join}
+            WHERE a.GVP = '{CONFIG["gvp_name"]}'
+              AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
+              AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
+              AND u.USE_CASE_STAGE NOT IN ({excluded})
+              AND {filter_clause}
+        )
+        SELECT *, TOTAL_ALL as TOTAL_COUNT,
+               CASE WHEN USE_CASE_RISK IS NOT NULL AND USE_CASE_RISK != '' AND USE_CASE_RISK != 'None'
+                    THEN 1 ELSE 0 END as HAS_RISK
+        FROM base
+        ORDER BY USE_CASE_EACV DESC
     """)
-    total_rows = run_query(f"""
-        SELECT COUNT(*) as TOTAL_COUNT
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        {extra_join}
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded}) AND {filter_clause}
-    """)
-    total = safe_int(total_rows[0]["TOTAL_COUNT"])
+    total = safe_int(rows[0]["TOTAL_COUNT"]) if rows else 0
+    risk_rows = [r for r in rows if r["HAS_RISK"] == 1]
     return {"risk_rows": risk_rows, "total_count": total}
 
 
@@ -1054,19 +1089,9 @@ AND FISCAL_QUARTER = '{CONFIG["fiscal_quarter"]}'
 
 def q_partner_sd_attach():
     excluded = ", ".join(f"'{s}'" for s in CONFIG["excluded_stages"])
-    rows = run_query(f"""
-        SELECT u.IMPLEMENTER_C, COUNT(*) as CNT, SUM(u.USE_CASE_ACV) as ACV
-        FROM {CONFIG["raven_uc_table"]} u
-        JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
-        WHERE a.GVP = '{CONFIG["gvp_name"]}'
-          AND u.USE_CASE_ACV > 0 AND u.IS_WENT_LIVE = FALSE AND u.IS_LOST = FALSE
-          AND u.GO_LIVE_DATE BETWEEN '{CONFIG["quarter_start"]}' AND '{CONFIG["quarter_end"]}'
-          AND u.USE_CASE_STAGE NOT IN ({excluded})
-        GROUP BY u.IMPLEMENTER_C
-    """)
-    # Also get distinct account IDs per implementer category for CC cross-reference
-    acct_rows = run_query(f"""
-        SELECT DISTINCT u.VH_ACCOUNT_C as ACCOUNT_ID, u.IMPLEMENTER_C
+    # Single query: per-UC rows with implementer + account ID (replaces 2 queries)
+    uc_rows = run_query(f"""
+        SELECT u.VH_ACCOUNT_C as ACCOUNT_ID, u.IMPLEMENTER_C, u.USE_CASE_ACV
         FROM {CONFIG["raven_uc_table"]} u
         JOIN {CONFIG["raven_acct_table"]} a ON u.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
         WHERE a.GVP = '{CONFIG["gvp_name"]}'
@@ -1080,34 +1105,29 @@ def q_partner_sd_attach():
     sd_values = {"Snowflake SD Prime", "Partner Prime + Snowflake SD",
                  "Customer Prime + Snowflake SD", "Snowflake SD Prime + Partner"}
     unassisted_values = {"Customer Only", "Unknown", "None", "", None}
-    for r in rows:
-        acv = safe_float(r["ACV"] or 0)
-        cnt = safe_int(r["CNT"] or 0)
-        impl = r["IMPLEMENTER_C"] or ""
-        total_acv += acv
-        total_count += cnt
-        if impl in partner_values:
-            partner_acv += acv
-            partner_count += cnt
-        if impl in sd_values:
-            sd_acv += acv
-            sd_count += cnt
-        if impl in unassisted_values:
-            unassisted_acv += acv
-            unassisted_count += cnt
-    partner_rate = (partner_acv / total_acv * 100) if total_acv else 0
-    sd_rate = (sd_acv / total_acv * 100) if total_acv else 0
-    # Collect account IDs by implementer category
     partner_accounts = set()
     sd_accounts = set()
-    for r in acct_rows:
-        impl = r.get("IMPLEMENTER_C") or ""
+    for r in uc_rows:
+        acv = safe_float(r["USE_CASE_ACV"] or 0)
+        impl = r["IMPLEMENTER_C"] or ""
         aid = r.get("ACCOUNT_ID")
-        if aid:
-            if impl in partner_values:
+        total_acv += acv
+        total_count += 1
+        if impl in partner_values:
+            partner_acv += acv
+            partner_count += 1
+            if aid:
                 partner_accounts.add(aid)
-            if impl in sd_values:
+        if impl in sd_values:
+            sd_acv += acv
+            sd_count += 1
+            if aid:
                 sd_accounts.add(aid)
+        if impl in unassisted_values:
+            unassisted_acv += acv
+            unassisted_count += 1
+    partner_rate = (partner_acv / total_acv * 100) if total_acv else 0
+    sd_rate = (sd_acv / total_acv * 100) if total_acv else 0
     partner_or_ps_accounts = partner_accounts | sd_accounts
     # Query CC cache directly for partner/PS accounts
     pps_cc_count = 0
@@ -1257,7 +1277,7 @@ def q_historical_conversion_rates(day_number):
     if not quarters:
         return []
     day_num = safe_int(day_number)
-    snapshot_table = "SALES.REPORTING.DIM_USE_CASE_HISTORY_DS"
+    snapshot_table = "SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW"
     unions = []
     for i, (qs, qe) in enumerate(quarters):
         q_label = f"{CONFIG['prior_fy_label']} Q{i+1}"
@@ -1538,7 +1558,7 @@ def compute_weighted_ensemble(forecast_analysis, backtest_results, day_number=31
 def q_backtest_models(hist_rates):
     if not hist_rates:
         return []
-    snapshot_table = "SALES.REPORTING.DIM_USE_CASE_HISTORY_DS"
+    snapshot_table = "SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW"
     raven_uc = CONFIG["raven_uc_table"]
     raven_acct = CONFIG["raven_acct_table"]
     gvp = CONFIG["gvp_name"]
@@ -2273,6 +2293,15 @@ def _run_all_queries(gvp_name, selected_quarter):
     uc_velocity = q_use_case_velocity()
     update_risk_thresholds_from_velocity(uc_velocity)
 
+    # Pin dim_uc_table to a concrete DS value so downstream queries skip MAX(DS) subquery
+    try:
+        _ds_rows = run_query("SELECT MAX(DS) AS MAX_DS FROM SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW")
+        if _ds_rows and _ds_rows[0]["MAX_DS"] is not None:
+            _max_ds = str(_ds_rows[0]["MAX_DS"])[:10]  # YYYY-MM-DD
+            CONFIG["dim_uc_table"] = f"(SELECT * FROM SNOWPUBLIC.STREAMLIT.DIM_USE_CASE_HISTORY_DS_VW WHERE DS = '{_max_ds}')"
+    except Exception:
+        pass  # Keep the original subquery-based definition
+
     # --- Phase 1: Parallel independent queries ---
     _tick("Loading data (parallel)...")
     phase1_queries = {
@@ -2301,6 +2330,7 @@ def _run_all_queries(gvp_name, selected_quarter):
         "pipeline_detail": q_risk_adjusted_pipeline_detail,
         "pipeline_phases": q_current_pipeline_phases,
         "cc_theater": q_cortex_code_theater_usage,
+        "regional_targets": q_regional_targets,
     }
     # Queries that need fiscal calendar results
     phase1_with_args = {
@@ -2355,6 +2385,13 @@ def _run_all_queries(gvp_name, selected_quarter):
     cc_theater = p1_results["cc_theater"]
     pacing = p1_results["pacing"]
     hist_conv_rates = p1_results["hist_conv_rates"]
+    regional_targets = p1_results.get("regional_targets", {})
+
+    # Populate targets from VP_REGIONAL_TARGETS_VIEW (go-live) and PEAK_FORECAST (revenue/consumption)
+    forecasts["target"] = regional_targets.get("Use Case Go Live", 0)
+    consumption_target = revenue.get("target", 0)
+    revenue["target"] = fmt_currency(consumption_target) if consumption_target else "TBD"
+    revenue["pct_target"] = fmt_pct(revenue["revenue"] / consumption_target * 100) if consumption_target else "TBD"
 
     # --- Phase 2: Queries that depend on Phase 1 account IDs (parallel) ---
     _tick("Account-level queries...")
@@ -2418,6 +2455,7 @@ def _run_all_queries(gvp_name, selected_quarter):
         "tb_ingested_target": tb_ingested_target,
         "si_usage": si_usage, "si_theater": si_theater, "pacing": pacing,
         "forecast_analysis": forecast_analysis, "play_targets": play_targets,
+        "regional_targets": regional_targets,
         "partner_sd": partner_sd, "uc_velocity": uc_velocity,
         "bronze_created": bronze_created, "si_created": si_created, "pipeline_movements": pipeline_movements,
         "cc_theater": cc_theater, "cc_by_account": cc_by_account,
@@ -2828,7 +2866,8 @@ def render_golives_tab(data):
 
     # Row 2: Bronze - DCT TBs Ingested
     br_tb_actual = bronze_tb_total
-    br_tb_target = data.get("tb_ingested_target")
+    _tb_target_raw = data.get("tb_ingested_target")
+    br_tb_target = _tb_target_raw if isinstance(_tb_target_raw, (int, float)) else None
     br_tb_target_str = f"{br_tb_target:,.0f} TB" if br_tb_target is not None else "&mdash;"
     br_tb_att = _sp_attainment(br_tb_actual, br_tb_target)
 
