@@ -2637,6 +2637,7 @@ def render_script_tab(data, selected_play_key):
     gl_target = forecasts["target"]
     deployed_pct = (deployed["acv"] / most_likely * 100) if most_likely else 0
     deployed_pct_of_target = (deployed["acv"] / gl_target * 100) if gl_target else 0
+    ml_pct_of_target = (most_likely / gl_target * 100) if gl_target else 0
     coverage_pct = ((pipeline["acv"] + deployed["acv"]) / most_likely * 100) if most_likely else 0
     total_good = sum(safe_float(r.get("GOOD_ACV", 0) or 0) for r in risk_analysis.values())
     total_risk_acv = sum(safe_float(r.get("AT_RISK_ACV", 0) or 0) for r in risk_analysis.values())
@@ -2684,7 +2685,7 @@ def render_script_tab(data, selected_play_key):
     script_html = f"""
 <div style="background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 24px; font-family: Georgia, serif; font-size: 1.05em; line-height: 1.7;">
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Forecast Call</h3>
-<p>For {_theater()}, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}.
+<p>For {_theater()}, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}, <strong>{fmt_pct(ml_pct_of_target)}</strong> of {fiscal["FISCAL_QUARTER"]} Target.
 We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a target of <strong>{fmt_currency(gl_target)}</strong> (<strong>{fmt_pct(deployed_pct_of_target)}</strong> of target).
 Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pipeline (Last 7 Days)</h3>
