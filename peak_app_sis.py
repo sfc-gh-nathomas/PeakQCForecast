@@ -3057,7 +3057,7 @@ st.set_page_config(
 # =============================================================================
 # ACCESS CONTROL — restrict to approved users
 # =============================================================================
-ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH", "NTSUI", "ADANNA"}
+ALLOWED_USERS = {"NATHOMAS", "SVANDAAL", "MMEREDITH", "NTSUI", "ADANNA", "JSMOLLETT", "JPATEL"}
 
 def _check_access():
     """Verify the current user is in the approved access list."""
@@ -3068,6 +3068,7 @@ def _check_access():
         "nick.tsui@snowflake.com",
         "alex.danna@snowflake.com",
         "jocqui.smollett@snowflake.com",
+        "jaime.patel@snowflake.com",
     }
     try:
         user_email = st.user.get("email", "").lower()
