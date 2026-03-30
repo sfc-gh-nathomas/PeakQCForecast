@@ -2652,6 +2652,16 @@ def render_script_tab(data, selected_play_key):
     week_pct_val = pacing["week_pct"]
     day_projection = (deployed["acv"] / (day_pct_val / 100)) if day_pct_val > 0 else None
     week_projection = (deployed["acv"] / (week_pct_val / 100)) if week_pct_val > 0 else None
+    day_ahead = deployed["acv"] >= day_avg if day_avg else True
+    week_ahead = deployed["acv"] >= week_avg if week_avg else True
+    if day_ahead and week_ahead:
+        pacing_direction = "ahead on both a daily and weekly basis"
+    elif not day_ahead and not week_ahead:
+        pacing_direction = "behind on both a daily and weekly basis"
+    elif day_ahead:
+        pacing_direction = "ahead on a daily basis but behind on a weekly basis"
+    else:
+        pacing_direction = "behind on a daily basis but ahead on a weekly basis"
     p_rate = partner_sd.get("partner_rate", 0)
     sd_rate = partner_sd.get("sd_rate", 0)
     p_acv = partner_sd.get("partner_acv", 0)
@@ -2690,19 +2700,19 @@ def render_script_tab(data, selected_play_key):
 We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a target of <strong>{fmt_currency(gl_target)}</strong> (<strong>{fmt_pct(deployed_pct_of_target)}</strong> of target).
 In the last 7 days, <strong>{last7["count"]}</strong> use cases (<strong>{fmt_currency(last7["acv"])}</strong>) went live.
 Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
+<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pacing</h3>
+<p>We are pacing <strong>{pacing_direction}</strong>.
+On Day <strong>{day_number}</strong> of the quarter, our current deployed ACV of <strong>{fmt_currency(deployed["acv"])}</strong>
+compares to a prior FY average of <strong>{fmt_currency(day_avg)}</strong> deployed by this day
+(<strong>{fmt_pct(day_pct_val)}</strong> of the prior FY average final of <strong>{fmt_currency(CONFIG["prior_fy_avg_final"] * 1e6)}</strong>).
+On a weekly basis (Week <strong>{week_number}</strong>), the prior FY average deployed was <strong>{fmt_currency(week_avg)}</strong>
+(<strong>{fmt_pct(week_pct_val)}</strong> of final).
+If we continue to follow this pacing, our projected quarter-end deployed ACV would be{f" <strong>{fmt_currency(day_projection)}</strong> based on daily pacing" if day_projection else " unavailable (no prior FY daily data)"}{f" and <strong>{fmt_currency(week_projection)}</strong> based on weekly pacing" if week_projection else ""}.</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pipeline (Last 7 Days)</h3>
 <p>In the last 7 days, <strong>{pm_pushed_out["count"]}</strong> use cases (<strong>{fmt_currency(pm_pushed_out["acv"])}</strong>) were pushed out of the quarter
 while <strong>{pm_pulled_in["count"]}</strong> (<strong>{fmt_currency(pm_pulled_in["acv"])}</strong>) were pulled in.
 <strong>{pm_imp_started["count"]}</strong> use cases (<strong>{fmt_currency(pm_imp_started["acv"])}</strong>) started implementation with a go-live this quarter.
-Net new pipeline (created in the last 7 days with a current-quarter go-live): <strong>{pm_new_pipeline["count"]}</strong> use cases, <strong>{fmt_currency(pm_new_pipeline["acv"])}</strong>.</p>
-<h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pacing</h3>
-<p>On Day <strong>{day_number}</strong> of the quarter, our current deployed ACV of <strong>{fmt_currency(deployed["acv"])}</strong>
-compares to a prior FY average of <strong>{fmt_currency(day_avg)}</strong> deployed by this day
-(<strong>{fmt_pct(day_pct_val)}</strong> of the prior FY average final of <strong>{fmt_currency(CONFIG["prior_fy_avg_final"] * 1e6)}</strong>).
-On a weekly basis (Week <strong>{week_number}</strong>), the prior FY average deployed was <strong>{fmt_currency(week_avg)}</strong>
-(<strong>{fmt_pct(week_pct_val)}</strong> of final).</p>
-<p>If the current quarter follows the same deployment curve as the prior FY average,
-our projected quarter-end deployed ACV would be{f" <strong>{fmt_currency(day_projection)}</strong> based on daily pacing" if day_projection else " unavailable (no prior FY daily data)"}{f" and <strong>{fmt_currency(week_projection)}</strong> based on weekly pacing" if week_projection else ""}.</p>
+In the last 7 days, <strong>{pm_new_pipeline["count"]}</strong> use cases were created with a go-live date in {fiscal["FISCAL_QUARTER"]} for <strong>{fmt_currency(pm_new_pipeline["acv"])}</strong>.</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Sales Play Detail</h3>
 """
     _ps = play_summary
