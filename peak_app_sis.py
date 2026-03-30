@@ -2632,6 +2632,7 @@ def render_script_tab(data, selected_play_key):
     pacing = data["pacing"]
     cfg = data["_config"]
     pm = data.get("pipeline_movements", {})
+    last7 = data["last7"]
 
     most_likely = forecasts["most_likely"]
     gl_target = forecasts["target"]
@@ -2687,6 +2688,7 @@ def render_script_tab(data, selected_play_key):
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Forecast Call</h3>
 <p>For {_theater()}, my Most Likely call for go-lives this quarter is <strong>{fmt_currency(most_likely)}</strong>{ml_wow_text}, <strong>{fmt_pct(ml_pct_of_target)}</strong> of {fiscal["FISCAL_QUARTER"]} Target.
 We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a target of <strong>{fmt_currency(gl_target)}</strong> (<strong>{fmt_pct(deployed_pct_of_target)}</strong> of target).
+In the last 7 days, <strong>{last7["count"]}</strong> use cases (<strong>{fmt_currency(last7["acv"])}</strong>) went live.
 Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pipeline (Last 7 Days)</h3>
 <p>In the last 7 days, <strong>{pm_pushed_out["count"]}</strong> use cases (<strong>{fmt_currency(pm_pushed_out["acv"])}</strong>) were pushed out of the quarter
