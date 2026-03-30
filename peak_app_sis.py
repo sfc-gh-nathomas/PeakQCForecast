@@ -2701,7 +2701,7 @@ We have deployed <strong>{fmt_currency(deployed["acv"])}</strong> QTD against a 
 In the last 7 days, <strong>{last7["count"]}</strong> use cases (<strong>{fmt_currency(last7["acv"])}</strong>) went live.
 Our open pipeline is <strong>{fmt_currency(pipeline["acv"])}</strong>, giving us <strong>{fmt_pct(coverage_pct)}</strong> ML coverage (deployed + open pipeline vs Most Likely).</p>
 <h3 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 8px;">Pacing</h3>
-<p>We are pacing <strong>{pacing_direction}</strong>.
+<p>Go-lives are pacing <strong>{pacing_direction}</strong>.
 On Day <strong>{day_number}</strong> of the quarter, our current deployed ACV of <strong>{fmt_currency(deployed["acv"])}</strong>
 compares to a prior FY average of <strong>{fmt_currency(day_avg)}</strong> deployed by this day
 (<strong>{fmt_pct(day_pct_val)}</strong> of the prior FY average final of <strong>{fmt_currency(CONFIG["prior_fy_avg_final"] * 1e6)}</strong>).
