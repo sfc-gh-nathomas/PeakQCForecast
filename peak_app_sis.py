@@ -555,7 +555,7 @@ def q_risk_adjusted_pipeline_detail():
                END AS RISK_STATUS
         FROM {CONFIG["dim_uc_table"]} u
         CROSS JOIN fiscal_qtr f
-        JOIN {CONFIG["raven_uc_table"]} r ON u.USE_CASE_ID = r.ID
+        JOIN {CONFIG["raven_uc_table"]} r ON u.RESOLVED_USE_CASE_ID = r.ID
         JOIN {CONFIG["raven_acct_table"]} a ON r.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
         WHERE a.GVP = '{CONFIG["gvp_name"]}'
             AND r.USE_CASE_ACV > 0 AND r.IS_WENT_LIVE = FALSE AND r.IS_LOST = FALSE
@@ -620,7 +620,7 @@ def q_pipeline_risk():
             END) AS GOOD_ACV
         FROM {CONFIG["dim_uc_table"]} u
         CROSS JOIN fiscal_qtr f
-        JOIN {CONFIG["raven_uc_table"]} r ON u.USE_CASE_ID = r.ID
+        JOIN {CONFIG["raven_uc_table"]} r ON u.RESOLVED_USE_CASE_ID = r.ID
         JOIN {CONFIG["raven_acct_table"]} a ON r.VH_ACCOUNT_C = a.SALESFORCE_ACCOUNT_ID
         WHERE a.GVP = '{CONFIG["gvp_name"]}'
             AND r.USE_CASE_ACV > 0 AND r.IS_WENT_LIVE = FALSE AND r.IS_LOST = FALSE
@@ -1324,7 +1324,7 @@ def q_historical_conversion_rates(day_number):
                 0 as NEW_PIPELINE_CONVERTED,
                 0 as FINAL_DEPLOYED
             FROM {snapshot_table} h
-            LEFT JOIN {CONFIG["raven_uc_table"]} o ON h.USE_CASE_ID = o.ID
+            LEFT JOIN {CONFIG["raven_uc_table"]} o ON h.RESOLVED_USE_CASE_ID = o.ID
             WHERE h.DS = {snap_date}
               AND h.THEATER_NAME = '{_theater()}'
               AND h.USE_CASE_EACV > 0
