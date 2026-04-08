@@ -1324,9 +1324,10 @@ def q_historical_conversion_rates(day_number):
                 0 as NEW_PIPELINE_CONVERTED,
                 0 as FINAL_DEPLOYED
             FROM {snapshot_table} h
-            LEFT JOIN {CONFIG["raven_uc_table"]} o ON h.RESOLVED_USE_CASE_ID = o.ID
+            LEFT JOIN id_map m ON h.USE_CASE_ID = m.USE_CASE_ID
+            LEFT JOIN {CONFIG["raven_uc_table"]} o ON m.RESOLVED_USE_CASE_ID = o.ID
             WHERE h.DS = {snap_date}
-              AND h.THEATER_NAME = '{_theater()}'
+              AND h.ACCOUNT_GVP = '{CONFIG["gvp_name"]}'
               AND h.USE_CASE_EACV > 0
         """)
 
@@ -1340,7 +1341,8 @@ def q_historical_conversion_rates(day_number):
                 COALESCE((SELECT SUM(o2.USE_CASE_ACV)
                  FROM {CONFIG["raven_uc_table"]} o2
                  JOIN {CONFIG["raven_acct_table"]} a2 ON o2.VH_ACCOUNT_C = a2.SALESFORCE_ACCOUNT_ID
-                 LEFT JOIN {snapshot_table} h2 ON h2.USE_CASE_ID = o2.ID AND h2.DS = {snap_date}
+                  LEFT JOIN id_map m2 ON m2.RESOLVED_USE_CASE_ID = o2.ID
+                  LEFT JOIN {snapshot_table} h2 ON h2.USE_CASE_ID = m2.USE_CASE_ID AND h2.DS = {snap_date}
                  WHERE a2.GVP = '{CONFIG["gvp_name"]}' AND o2.USE_CASE_ACV > 0
                    AND o2.IS_WENT_LIVE = TRUE AND o2.DEFAULT_DATE BETWEEN '{qs}' AND '{qe}'
                    AND (h2.USE_CASE_ID IS NULL OR h2.CREATED_DATE > {snap_date})
@@ -1353,9 +1355,16 @@ def q_historical_conversion_rates(day_number):
                 ), 0) as FINAL_DEPLOYED
         """)
 
-    rows = run_query(" UNION ALL ".join(unions) + " ORDER BY QTR")
+    id_map_cte = (
+        f"WITH id_map AS ("
+        f"SELECT DISTINCT USE_CASE_ID, RESOLVED_USE_CASE_ID "
+        f"FROM {snapshot_table} "
+        f"WHERE DS = (SELECT MAX(DS) FROM {snapshot_table}) "
+        f"AND RESOLVED_USE_CASE_ID IS NOT NULL) "
+    )
+    rows = run_query(id_map_cte + " UNION ALL ".join(unions) + " ORDER BY QTR")
     if np_fd_unions:
-        np_fd_rows = run_query(" UNION ALL ".join(np_fd_unions) + " ORDER BY QTR")
+        np_fd_rows = run_query(id_map_cte + " UNION ALL ".join(np_fd_unions) + " ORDER BY QTR")
         np_fd_map = {r["QTR"]: r for r in np_fd_rows}
         for r in rows:
             qtr_data = np_fd_map.get(r["QTR"], {})
