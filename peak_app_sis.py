@@ -2006,7 +2006,35 @@ historical pacing, and milestone-based conversion rates. All data is for {_theat
       <div class="fa-vs-item"><div class="fa-vs-label">Most Likely</div><div class="fa-vs-value likely">{fmt_currency(m3["most_likely"])}</div></div>
       <div class="fa-vs-item"><div class="fa-vs-label">Stretch</div><div class="fa-vs-value stretch">{fmt_currency(m3["stretch"])}</div></div>
     </div>
-    <div class="fa-note">Rates: Imp {rates.get('imp', 0)*100:.1f}% | TW {rates.get('tw', 0)*100:.1f}% | Pre-TW {rates.get('pre_tw', 0)*100:.1f}% | New Pipeline {rates.get('new_pipeline', 0)*100:.1f}%</div>
+    <div style="margin-top: 10px; font-size: 0.82em;">
+      <table style="width:100%; border-collapse: collapse;">
+        <tr style="border-bottom: 1px solid #dee2e6; color: #666;">
+          <th style="text-align:left; padding: 3px 4px;">Stage</th>
+          <th style="text-align:right; padding: 3px 4px;">Pipeline</th>
+          <th style="text-align:right; padding: 3px 4px;">Conv %</th>
+          <th style="text-align:right; padding: 3px 4px;">Expected</th>
+        </tr>
+        <tr>
+          <td style="padding: 3px 4px;">In Implementation</td>
+          <td style="text-align:right; padding: 3px 4px;">{fmt_currency(pp["in_imp"])}</td>
+          <td style="text-align:right; padding: 3px 4px;">{rates.get('imp', 0)*100:.1f}%</td>
+          <td style="text-align:right; padding: 3px 4px; font-weight:600;">{fmt_currency(pp["in_imp"] * rates.get('imp', 0))}</td>
+        </tr>
+        <tr style="background:#fafafa;">
+          <td style="padding: 3px 4px;">Post-TW / Pre-Imp</td>
+          <td style="text-align:right; padding: 3px 4px;">{fmt_currency(pp["post_tw"])}</td>
+          <td style="text-align:right; padding: 3px 4px;">{rates.get('tw', 0)*100:.1f}%</td>
+          <td style="text-align:right; padding: 3px 4px; font-weight:600;">{fmt_currency(pp["post_tw"] * rates.get('tw', 0))}</td>
+        </tr>
+        <tr>
+          <td style="padding: 3px 4px;">Pre-TW</td>
+          <td style="text-align:right; padding: 3px 4px;">{fmt_currency(pp["pre_tw"])}</td>
+          <td style="text-align:right; padding: 3px 4px;">{rates.get('pre_tw', 0)*100:.1f}%</td>
+          <td style="text-align:right; padding: 3px 4px; font-weight:600;">{fmt_currency(pp["pre_tw"] * rates.get('pre_tw', 0))}</td>
+        </tr>
+      </table>
+      <div style="color:#888; margin-top:4px;">New Pipeline contribution: {rates.get('new_pipeline', 0)*100:.1f}% of final deployed</div>
+    </div>
   </div>
 
 """
